@@ -1,0 +1,6 @@
+{
+  "name": "PGDesk",
+  "description": "Multi-property Paying Guest & Co-living Management SaaS for India — rooms, visual bed-maps, automated rent billing, UPI tracking, complaints, tenant portal, and public listings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
