@@ -46,20 +46,23 @@ export async function isAdminBootstrapLocked(): Promise<boolean> {
 }
 
 export async function ensureAdminBootstrapped(): Promise<void> {
+  let adminPool: Pool | null = null;
   try {
     const runtimeRole = process.env.SQL_USER || process.env.SQL_ADMIN_USER;
     if (!runtimeRole) {
       throw new Error('SQL_USER or SQL_ADMIN_USER must be configured');
     }
-    const adminPool = new Pool({
+    const adminRole = process.env.SQL_ADMIN_USER || process.env.SQL_USER;
+    adminPool = new Pool({
       host: process.env.SQL_HOST,
-      user: process.env.SQL_ADMIN_USER || process.env.SQL_USER,
+      user: adminRole,
       password: process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
       max: 1,
       connectionTimeoutMillis: 15000,
     });
     const adminDb = drizzle(adminPool, { schema });
+    console.log(`[SchemaSync] Running migrations as ${adminRole}; runtime role is ${runtimeRole}.`);
 
     const migrationStatements = [
       sql`DO $$ BEGIN ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'ADMIN'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
@@ -143,12 +146,17 @@ export async function ensureAdminBootstrapped(): Promise<void> {
       )};`,
     ];
 
-    try {
-      for (const stmt of migrationStatements) {
+    for (const [index, stmt] of migrationStatements.entries()) {
+      try {
         await adminDb.execute(stmt);
+      } catch (migrationErr) {
+        const error = migrationErr as { message?: string; code?: string };
+        console.error(`[SchemaSync] Statement ${index + 1}/${migrationStatements.length} failed as ${adminRole}:`, {
+          message: error.message,
+          code: error.code,
+          error: migrationErr,
+        });
       }
-    } finally {
-      await adminPool.end();
     }
     const platformOrg = await ensurePlatformOrg();
     const locked = await isAdminBootstrapLocked();
@@ -223,8 +231,18 @@ export async function ensureAdminBootstrapped(): Promise<void> {
       });
     }
   } catch (err) {
-    console.error('Admin bootstrap check failed:', err);
-    throw err;
+    const error = err as { message?: string; code?: string };
+    console.error('Admin bootstrap check failed; continuing so the server can start:', {
+      message: error.message,
+      code: error.code,
+      error: err,
+    });
+  } finally {
+    if (adminPool) {
+      await adminPool.end().catch((err) => {
+        console.error('Failed to close admin bootstrap pool:', err);
+      });
+    }
   }
 }
 
