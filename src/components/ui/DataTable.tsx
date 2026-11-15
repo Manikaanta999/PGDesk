@@ -21,6 +21,7 @@ interface DataTableProps<TData> {
   emptyAction?: React.ReactNode;
   pageSize?: number;
   toolbarExtra?: React.ReactNode;
+  renderMobileCard?: (row: TData) => React.ReactNode;
 }
 
 export function DataTable<TData>({
@@ -34,6 +35,7 @@ export function DataTable<TData>({
   emptyAction,
   pageSize = 10,
   toolbarExtra,
+  renderMobileCard,
 }: DataTableProps<TData>) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [localSearch, setLocalSearch] = useState('');
@@ -63,8 +65,8 @@ export function DataTable<TData>({
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
-      <div className="flex flex-col gap-3 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800">
-        <div className="relative w-full sm:max-w-xs">
+      <div className="flex flex-col gap-3 border-b border-slate-200 p-4 lg:flex-row lg:items-center lg:justify-between dark:border-slate-800">
+        <div className="relative w-full lg:max-w-md">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <input
             type="search"
@@ -72,7 +74,7 @@ export function DataTable<TData>({
             onChange={(e) => handleSearch(e.target.value)}
             placeholder={searchPlaceholder}
             aria-label={searchPlaceholder}
-            className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:focus:border-teal-500"
+            className="min-h-[40px] w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:focus:border-teal-500 dark:focus:bg-slate-950"
           />
         </div>
         {toolbarExtra && <div className="flex flex-wrap items-center gap-2">{toolbarExtra}</div>}
@@ -86,7 +88,17 @@ export function DataTable<TData>({
         </div>
       ) : (
         <>
-          <div className="overflow-x-auto">
+          {renderMobileCard && (
+            <div className="divide-y divide-slate-100 md:hidden dark:divide-slate-800">
+              {table.getRowModel().rows.map((row) => (
+                <div key={row.id} className="p-4">
+                  {renderMobileCard(row.original)}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className={`overflow-x-auto ${renderMobileCard ? 'hidden md:block' : ''}`}>
             <table className="w-full border-collapse text-left text-sm">
               <thead>
                 {table.getHeaderGroups().map((hg) => (

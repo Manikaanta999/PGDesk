@@ -52,34 +52,96 @@ export const updateBedStatusSchema = z.object({
   monthlyRentOverride: z.coerce.number().int().min(1000).max(200000).optional().nullable(),
 });
 
+export const addRoomBedsSchema = z.object({
+  count: z.coerce.number().int().min(1).max(8),
+  monthlyRentOverride: z.coerce.number().int().min(1000).max(200000).optional().nullable(),
+});
+
+export const optionalIndianPhoneSchema = z
+  .string()
+  .trim()
+  .optional()
+  .default('')
+  .refine((val) => {
+    if (!val) return true;
+    const digits = val.replace(/\D/g, '');
+    return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+  }, 'Enter a valid 10-digit Indian mobile number');
+
 export const createTenantSchema = z
   .object({
     name: z.string().trim().min(2, 'Full name is required').max(120),
-    phone: indianPhoneSchema,
+    phone: optionalIndianPhoneSchema,
     email: z.string().trim().email('Valid email required').optional().or(z.literal('')),
     propertyId: z.coerce.number().int().positive(),
     bedId: z.coerce.number().int().positive(),
-    idType: z.enum(['Aadhaar', 'PAN', 'Passport', 'Driving License', 'College ID']),
-    idNumberMasked: z.string().trim().min(4).max(32),
+    enquiryId: z.coerce.number().int().positive().optional(),
+    idType: z.enum(['Aadhaar', 'PAN', 'Passport', 'Driving License', 'College ID']).optional().default('Aadhaar'),
+    idNumberMasked: z.string().trim().max(32).optional().default(''),
     idDocumentUrl: z.string().trim().optional().nullable(),
-    occupation: z.string().trim().min(2).max(80),
-    companyOrCollege: z.string().trim().max(120).default(''),
-    permanentAddress: z.string().trim().min(5, 'Permanent address is required').max(300),
-    emergencyContactName: z.string().trim().min(2, 'Emergency contact name is required').max(80),
-    emergencyContactPhone: indianPhoneSchema,
+    occupation: z.string().trim().max(80).optional().default('Resident'),
+    companyOrCollege: z.string().trim().max(120).optional().default(''),
+    permanentAddress: z.string().trim().max(300).optional().default(''),
+    emergencyContactName: z.string().trim().max(80).optional().default(''),
+    emergencyContactPhone: optionalIndianPhoneSchema,
     joinDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD format'),
     monthlyRent: z.coerce.number().int().min(1000).max(200000),
     securityDeposit: z.coerce.number().int().min(0).max(500000),
-    generateJoiningInvoice: z.boolean().default(true),
+    generateJoiningInvoice: z.boolean().default(false),
   })
   .superRefine((val, ctx) => {
-    const check = validateMaskedIdNumber(val.idType, val.idNumberMasked);
-    if (!check.valid) {
+    const hasPhone = Boolean(val.phone && val.phone.trim().length > 0);
+    const hasEmail = Boolean(val.email && val.email.trim().length > 0);
+    if (!hasPhone && !hasEmail) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: check.message || 'Invalid ID format',
-        path: ['idNumberMasked'],
+        message: 'Provide at least a mobile number or an email address.',
+        path: ['phone'],
       });
+    }
+    if (val.idNumberMasked && val.idNumberMasked.trim().length > 0) {
+      const check = validateMaskedIdNumber(val.idType, val.idNumberMasked);
+      if (!check.valid) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: check.message || 'Invalid ID format',
+          path: ['idNumberMasked'],
+        });
+      }
+    }
+  });
+
+export const updateTenantProfileSchema = z
+  .object({
+    name: z.string().trim().min(2, 'Full name is required').max(120),
+    phone: optionalIndianPhoneSchema,
+    photoUrl: z.string().trim().max(500).optional().nullable(),
+    dateOfBirth: z
+      .string()
+      .trim()
+      .refine((v) => v === '' || /^\d{4}-\d{2}-\d{2}$/.test(v), 'Use YYYY-MM-DD format')
+      .optional()
+      .nullable(),
+    occupation: z.string().trim().max(80).optional().default(''),
+    companyOrCollege: z.string().trim().max(120).optional().default(''),
+    permanentAddress: z.string().trim().max(300).optional().default(''),
+    emergencyContactName: z.string().trim().max(80).optional().default(''),
+    emergencyContactRelation: z.string().trim().max(60).optional().default(''),
+    emergencyContactPhone: optionalIndianPhoneSchema,
+    idType: z.enum(['Aadhaar', 'PAN', 'Passport', 'Driving License', 'College ID']).optional().default('Aadhaar'),
+    idNumberMasked: z.string().trim().max(32).optional().default(''),
+    idDocumentUrl: z.string().trim().optional().nullable(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.idNumberMasked && val.idNumberMasked.trim().length > 0) {
+      const check = validateMaskedIdNumber(val.idType, val.idNumberMasked);
+      if (!check.valid) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: check.message || 'Invalid ID format',
+          path: ['idNumberMasked'],
+        });
+      }
     }
   });
 
@@ -154,19 +216,31 @@ export const createExpenseSchema = z.object({
   note: z.string().trim().max(300).default(''),
 });
 
-export const publicEnquirySchema = z.object({
-  propertyId: z.coerce.number().int().positive(),
-  name: z.string().trim().min(2, 'Your name is required').max(100),
-  phone: indianPhoneSchema,
-  email: z.string().trim().email('Invalid email').optional().or(z.literal('')),
-  preferredRoomType: z.enum(['SINGLE', 'DOUBLE', 'TRIPLE', 'DORM']).default('DOUBLE'),
-  moveInDate: z.string().trim().max(32).optional(),
-  message: z.string().trim().max(600).default(''),
-  website: z.string().max(0).optional(), // Honeypot spam trap
-});
+export const publicEnquirySchema = z
+  .object({
+    propertyId: z.coerce.number().int().positive(),
+    name: z.string().trim().min(2, 'Your name is required').max(100),
+    phone: optionalIndianPhoneSchema,
+    email: z.string().trim().email('Invalid email').optional().or(z.literal('')),
+    preferredRoomType: z.enum(['SINGLE', 'DOUBLE', 'TRIPLE', 'DORM']).default('DOUBLE'),
+    moveInDate: z.string().trim().max(32).optional(),
+    message: z.string().trim().max(600).default(''),
+    website: z.string().max(0).optional(), // Honeypot spam trap
+  })
+  .superRefine((val, ctx) => {
+    const hasPhone = Boolean(val.phone && val.phone.trim().length > 0);
+    const hasEmail = Boolean(val.email && val.email.trim().length > 0);
+    if (!hasPhone && !hasEmail) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Provide at least a mobile number or an email address.',
+        path: ['phone'],
+      });
+    }
+  });
 
 export const updateEnquirySchema = z.object({
-  status: z.enum(['NEW', 'CONTACTED', 'VISIT_SCHEDULED', 'CONVERTED', 'LOST']),
+  status: z.enum(['NEW_ENQUIRY', 'CONTACTED', 'APPROVED', 'REJECTED', 'CONVERTED_TO_STUDENT']),
   notes: z.string().trim().max(600).default(''),
 });
 
@@ -194,6 +268,8 @@ export const updateSettingsSchema = z.object({
   phone: indianPhoneSchema,
   email: z.string().trim().email(),
   address: z.string().trim().min(5).max(250),
+  bankDetails: z.string().trim().max(400).optional().default(''),
+  paymentInstructions: z.string().trim().max(500).optional().default(''),
 });
 
 export const inviteStaffSchema = z.object({
@@ -208,31 +284,115 @@ export const inviteStaffSchema = z.object({
 export const registerSchema = z
   .object({
     accountType: z.enum(['OWNER', 'TENANT']).default('OWNER'),
+    ownerRegistrationToken: z.string().trim().optional().default(''),
     name: z.string().trim().min(2, 'Full name is required').max(120),
     organizationName: z.string().trim().max(120).optional().default(''),
     email: z.string().trim().email('Enter a valid email address'),
-    phone: indianPhoneSchema,
+    phone: optionalIndianPhoneSchema,
     password: z.string().min(6, 'Password must be at least 6 characters').max(100),
   })
-  .refine(
-    (val) => val.accountType !== 'OWNER' || val.organizationName.trim().length >= 2,
-    {
-      message: 'PG / Business name is required (min 2 characters)',
-      path: ['organizationName'],
+  .superRefine((val, ctx) => {
+    if (val.accountType === 'OWNER') {
+      if (val.organizationName.trim().length < 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'PG / Business name is required (min 2 characters)',
+          path: ['organizationName'],
+        });
+      }
+      if (!val.ownerRegistrationToken || val.ownerRegistrationToken.trim().length < 10) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Valid Owner Registration Token is required to register an owner account',
+          path: ['ownerRegistrationToken'],
+        });
+      }
+      if (!val.phone || val.phone.trim().length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Mobile number is required for hostel owners',
+          path: ['phone'],
+        });
+      }
     }
-  );
+  });
 
-export const verifyOtpSchema = z.object({
+export const verifyEmailSchema = z.object({
   email: z.string().trim().email('Valid email is required'),
-  otp: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
+  code: z.string().trim().min(6, 'Enter the verification code sent to your email').max(64),
+});
+
+export const resendVerificationSchema = z.object({
+  email: z.string().trim().email('Valid email is required'),
 });
 
 export const forgotPasswordSchema = z.object({
-  identifier: z.string().trim().min(3, 'Enter your registered email or mobile number'),
+  email: z.string().trim().email('Enter your registered email address'),
 });
 
 export const resetPasswordSchema = z.object({
-  identifier: z.string().trim().min(3, 'Email or mobile number is required'),
-  code: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit reset code'),
+  email: z.string().trim().email('Enter your registered email address'),
+  code: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit email reset code'),
   newPassword: z.string().min(6, 'New password must be at least 6 characters').max(100),
+});
+
+export const studentMoveOutRequestSchema = z.object({
+  requestedLeaveDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Select a valid expected leaving date'),
+  reason: z.string().trim().min(2, 'Please provide a reason for leaving').max(200),
+  notes: z.string().trim().max(500).optional().default(''),
+});
+
+export const ownerMoveOutReviewSchema = z.object({
+  status: z.enum(['UNDER_REVIEW', 'REJECTED']),
+  ownerNote: z.string().trim().max(400).optional().default(''),
+});
+
+export const updateAccountProfileSchema = z.object({
+  name: z.string().trim().min(2, 'Full name is required').max(120),
+  photoUrl: z.string().trim().max(500).optional().nullable(),
+});
+
+export const changePasswordSchema = z
+  .object({
+    currentPassword: z.string().min(1, 'Current password is required'),
+    newPassword: z.string().min(6, 'New password must be at least 6 characters').max(100),
+    confirmNewPassword: z.string().min(6, 'Please confirm your new password').max(100),
+  })
+  .refine((val) => val.newPassword === val.confirmNewPassword, {
+    message: 'New password and confirmation do not match',
+    path: ['confirmNewPassword'],
+  })
+  .refine((val) => val.newPassword !== val.currentPassword, {
+    message: 'New password must be different from your current password',
+    path: ['newPassword'],
+  });
+
+export const setOrResetPasswordSchema = z
+  .object({
+    currentPassword: z.string().optional().default(''),
+    newPassword: z.string().min(6, 'New password must be at least 6 characters').max(100),
+    confirmNewPassword: z.string().min(6, 'Please confirm your new password').max(100),
+  })
+  .refine((val) => val.newPassword === val.confirmNewPassword, {
+    message: 'New password and confirmation do not match',
+    path: ['confirmNewPassword'],
+  });
+
+export const requestEmailChangeSchema = z.object({
+  currentPassword: z.string().optional().default(''),
+  newEmail: z.string().trim().email('Enter a valid new email address'),
+});
+
+export const confirmCodeSchema = z.object({
+  code: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
+});
+
+export const updateDirectPhoneSchema = z.object({
+  phone: indianPhoneSchema,
+});
+
+export const updateNotificationPrefsSchema = z.object({
+  hostelNotices: z.boolean().default(true),
+  rentReminders: z.boolean().default(true),
+  complaintUpdates: z.boolean().default(true),
 });

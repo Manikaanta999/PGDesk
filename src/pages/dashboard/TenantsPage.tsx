@@ -4,17 +4,21 @@ import { ColumnDef } from '@tanstack/react-table';
 import { Check, Download, Plus, Upload, X } from 'lucide-react';
 import { DashboardLayout } from '../../components/layout/DashboardLayout';
 import { DataTable } from '../../components/ui/DataTable';
+import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
 import { apiFetch } from '../../lib/api';
 import { validateMaskedIdNumber } from '../../lib/billing';
+import { formatAccountLinkStatus, formatTenantStatus } from '../../lib/dashboardHelpers';
 import { formatDateIN, formatIndianPhone, formatINR } from '../../lib/format';
 import { buildTenantsCsv, getTenantsCsvFilename } from '../../lib/tenantCsv';
 
 interface TenantRow {
   id: number;
   name: string;
-  phone: string;
+  phone: string | null;
   email: string | null;
+  userId?: number | null;
+  accountLinkStatus?: string;
   propertyId: number;
   propertyName: string;
   bedLabel: string;
@@ -45,6 +49,7 @@ interface BedOption {
 
 export function TenantsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { tHeading } = useLanguage();
   const { showToast } = useToast();
 
   const [tenants, setTenants] = useState<TenantRow[]>([]);
@@ -62,9 +67,10 @@ export function TenantsPage() {
   const [submitting, setSubmitting] = useState(false);
 
   const [form, setForm] = useState({
-    name: '',
-    phone: '',
-    email: '',
+    enquiryId: searchParams.get('enquiryId') ? Number(searchParams.get('enquiryId')) : undefined as number | undefined,
+    name: searchParams.get('name') || '',
+    phone: searchParams.get('phone') || '',
+    email: searchParams.get('email') || '',
     occupation: 'Software Engineer',
     companyOrCollege: '',
     permanentAddress: '',
@@ -78,8 +84,36 @@ export function TenantsPage() {
     joinDate: new Date().toISOString().slice(0, 10),
     monthlyRent: Number(searchParams.get('rent') || 12000),
     securityDeposit: Number(searchParams.get('rent') || 12000) * 2,
-    generateJoiningInvoice: true,
+    generateJoiningInvoice: false,
   });
+
+  useEffect(() => {
+    const isNew = searchParams.get('new') === '1';
+    const enquiryParam = searchParams.get('enquiryId') ? Number(searchParams.get('enquiryId')) : undefined;
+    const nameParam = searchParams.get('name') || '';
+    const phoneParam = searchParams.get('phone') || '';
+    const emailParam = searchParams.get('email') || '';
+    const propParam = Number(searchParams.get('propertyId') || 0);
+    const bedParam = Number(searchParams.get('bedId') || 0);
+    const rentParam = Number(searchParams.get('rent') || 0);
+    if (isNew) {
+      setWizardOpen(true);
+      setStep(1);
+    }
+    if (propParam || bedParam || rentParam || enquiryParam || nameParam || phoneParam || emailParam) {
+      setForm((prev) => ({
+        ...prev,
+        enquiryId: enquiryParam ?? prev.enquiryId,
+        name: nameParam || prev.name,
+        phone: phoneParam || prev.phone,
+        email: emailParam || prev.email,
+        propertyId: propParam || prev.propertyId,
+        bedId: bedParam || prev.bedId,
+        monthlyRent: rentParam || prev.monthlyRent,
+        securityDeposit: rentParam ? rentParam * 2 : prev.securityDeposit,
+      }));
+    }
+  }, [searchParams]);
 
   const loadTenants = useCallback(async () => {
     const params = new URLSearchParams({ pageSize: '100' });
@@ -175,15 +209,45 @@ export function TenantsPage() {
   const handleOnboardSubmit = async () => {
     setSubmitting(true);
     try {
+      const onboardedName = form.name;
+      const { enquiryId, ...rest } = form;
       await apiFetch('/api/tenants', {
         method: 'POST',
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          ...rest,
+          ...(enquiryId ? { enquiryId } : {}),
+        }),
       });
-      showToast(`${form.name} onboarded and bed assigned!`);
+      showToast(`${onboardedName} onboarded and bed assigned!`);
       setWizardOpen(false);
       setStep(1);
+      setSearch('');
+      setStatusFilter('ALL');
+      setPropertyFilter('');
+      setDueOnly(false);
       setSearchParams({});
-      await loadTenants();
+      setForm({
+        enquiryId: undefined,
+        name: '',
+        phone: '',
+        email: '',
+        occupation: 'Software Engineer',
+        companyOrCollege: '',
+        permanentAddress: '',
+        emergencyContactName: '',
+        emergencyContactPhone: '',
+        idType: 'Aadhaar',
+        idNumberMasked: '',
+        idDocumentUrl: '',
+        propertyId: properties[0]?.id || 0,
+        bedId: 0,
+        joinDate: new Date().toISOString().slice(0, 10),
+        monthlyRent: 12000,
+        securityDeposit: 24000,
+        generateJoiningInvoice: false,
+      });
+      const fresh = await apiFetch<{ tenants: TenantRow[] }>('/api/tenants?pageSize=100');
+      setTenants(fresh.tenants);
     } catch (err: any) {
       showToast(err.message || 'Onboarding failed — check required fields', 'error');
     } finally {
@@ -223,18 +287,22 @@ export function TenantsPage() {
               {row.original.name}
             </Link>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              {formatIndianPhone(row.original.phone)} · {row.original.companyOrCollege || row.original.occupation}
+              {row.original.phone ? formatIndianPhone(row.original.phone) : row.original.email || 'No contact'} ·{' '}
+              {row.original.companyOrCollege || row.original.occupation} ·{' '}
+              {formatAccountLinkStatus(row.original.accountLinkStatus)}
             </p>
           </div>
         ),
       },
       {
         accessorKey: 'bedLabel',
-        header: 'Property / Bed',
+        header: 'Hostel / Room & Bed',
         cell: ({ row }) => (
           <div>
             <p className="font-mono text-xs font-semibold text-slate-800 dark:text-slate-200">
-              Bed {row.original.bedLabel}
+              {row.original.roomNumber
+                ? `Room ${row.original.roomNumber} · Bed ${row.original.bedLabel}`
+                : `Bed ${row.original.bedLabel}`}
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400">{row.original.propertyName}</p>
           </div>
@@ -272,10 +340,10 @@ export function TenantsPage() {
                 ? 'text-emerald-700 dark:text-emerald-400'
                 : row.original.status === 'NOTICE'
                   ? 'text-amber-700 dark:text-amber-400'
-                  : 'text-slate-500'
+                  : 'text-slate-500 dark:text-slate-400'
             }`}
           >
-            {row.original.status}
+            {formatTenantStatus(row.original.status)}
           </span>
         ),
       },
@@ -290,8 +358,8 @@ export function TenantsPage() {
 
   return (
     <DashboardLayout
-      title="Residents & Onboarding"
-      breadcrumb="Dashboard / Tenants"
+      title={tHeading('heading.pageStudents')}
+      breadcrumb="Home / Students"
       actions={
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -312,28 +380,102 @@ export function TenantsPage() {
             className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 whitespace-nowrap"
           >
             <Plus className="h-3.5 w-3.5" />
-            <span>Add Tenant</span>
+            <span>Add Student</span>
           </button>
         </div>
       }
     >
+      <p className="mb-4 text-sm text-slate-600 dark:text-slate-400">
+        Manage all students staying in your hostels.
+      </p>
+
       <DataTable
         data={tenants}
         columns={columns}
         searchValue={search}
         onSearchChange={setSearch}
-        searchPlaceholder="Search by name, mobile, bed, or company..."
-        emptyTitle="No matching tenants"
-        emptyDescription="Try clearing your search or filters, or onboard a new resident."
+        searchPlaceholder="Search by name, mobile, room, or bed..."
+        emptyTitle="No matching students"
+        emptyDescription="Try clearing your search or filters, or add a new student."
+        renderMobileCard={(t) => (
+          <div className="space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <Link
+                  to={`/dashboard/tenants/${t.id}`}
+                  className="font-semibold text-slate-900 hover:text-teal-700 dark:text-white dark:hover:text-teal-400"
+                >
+                  {t.name}
+                </Link>
+                <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  {t.phone ? formatIndianPhone(t.phone) : t.email || 'No contact'} ·{' '}
+                  {t.companyOrCollege || t.occupation} · {formatAccountLinkStatus(t.accountLinkStatus)}
+                </p>
+              </div>
+              <span
+                className={`shrink-0 text-xs font-semibold ${
+                  t.status === 'ACTIVE'
+                    ? 'text-emerald-700 dark:text-emerald-400'
+                    : t.status === 'NOTICE'
+                      ? 'text-amber-700 dark:text-amber-400'
+                      : 'text-slate-500 dark:text-slate-400'
+                }`}
+              >
+                {formatTenantStatus(t.status)}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <p className="text-slate-500 dark:text-slate-400">Hostel &amp; Bed</p>
+                <p className="mt-0.5 font-medium text-slate-800 dark:text-slate-200">
+                  {t.propertyName} ·{' '}
+                  <span className="font-mono">
+                    {t.roomNumber ? `Room ${t.roomNumber} (${t.bedLabel})` : `Bed ${t.bedLabel}`}
+                  </span>
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-slate-500 dark:text-slate-400">Monthly Rent</p>
+                <p className="mt-0.5 font-mono font-semibold tabular-nums text-slate-900 dark:text-white">
+                  {formatINR(t.monthlyRent)}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between border-t border-slate-100 pt-2.5 text-xs dark:border-slate-800">
+              <div className="tabular-nums">
+                <span className="text-slate-500 dark:text-slate-400">Due: </span>
+                <span
+                  className={`font-mono font-semibold ${
+                    t.balanceDue > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-400'
+                  }`}
+                >
+                  {t.balanceDue > 0 ? formatINR(t.balanceDue) : 'Cleared'}
+                </span>
+                <span className="ml-2 text-slate-400">· Joined {formatDateIN(t.joinDate)}</span>
+              </div>
+              <Link
+                to={`/dashboard/tenants/${t.id}`}
+                className="font-semibold text-teal-700 hover:underline whitespace-nowrap dark:text-teal-400"
+              >
+                View Profile
+              </Link>
+            </div>
+          </div>
+        )}
         toolbarExtra={
           <>
+            <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-700 tabular-nums dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300">
+              Total Students: <strong className="font-mono">{tenants.length}</strong>
+            </span>
             <select
-              aria-label="Filter by property"
+              aria-label="Filter by hostel"
               value={propertyFilter}
               onChange={(e) => setPropertyFilter(e.target.value)}
-              className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950"
+              className="min-h-[40px] rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950"
             >
-              <option value="">All Properties</option>
+              <option value="">All Hostels</option>
               {properties.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name}
@@ -344,14 +486,14 @@ export function TenantsPage() {
               aria-label="Filter by status"
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
-              className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950"
+              className="min-h-[40px] rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950"
             >
               <option value="ALL">All Statuses</option>
               <option value="ACTIVE">Active</option>
               <option value="NOTICE">On Notice</option>
               <option value="LEFT">Moved Out</option>
             </select>
-            <label className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">
+            <label className="inline-flex min-h-[40px] items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">
               <input
                 type="checkbox"
                 checked={dueOnly}
@@ -370,8 +512,8 @@ export function TenantsPage() {
             <div className="flex items-center justify-between border-b border-slate-200 pb-4 dark:border-slate-800">
               <div>
                 <h3 className="font-display text-lg font-semibold">Onboard New Tenant</h3>
-                <p className="text-xs text-slate-500">
-                  Step {step} of 4 · {step === 1 ? 'Personal Details' : step === 2 ? 'KYC & ID Upload' : step === 3 ? 'Bed Assignment' : 'Rent & Deposit'}
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Step {step} of 4 · {step === 1 ? 'Personal Details' : step === 2 ? 'KYC & Emergency Contact (Optional)' : step === 3 ? 'Bed Assignment' : 'Rent & Deposit'}
                 </p>
               </div>
               <button
@@ -395,35 +537,37 @@ export function TenantsPage() {
                     value={form.name}
                     onChange={(e) => setForm({ ...form, name: e.target.value })}
                     placeholder="Resident full name"
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
+                <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">
+                  Provide at least a mobile number or an email address. Student account creation is optional and can be linked later.
+                </div>
                 <div>
-                  <label className="block text-xs font-medium">Mobile Number *</label>
+                  <label className="block text-xs font-medium">Mobile Number</label>
                   <input
-                    required
                     value={form.phone}
                     onChange={(e) => setForm({ ...form, phone: e.target.value })}
                     placeholder="+91 98765 43210"
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium">Email (for Tenant Portal)</label>
+                  <label className="block text-xs font-medium">Email Address</label>
                   <input
                     type="email"
                     value={form.email}
                     onChange={(e) => setForm({ ...form, email: e.target.value })}
                     placeholder="resident@company.com"
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium">Occupation *</label>
+                  <label className="block text-xs font-medium">Occupation</label>
                   <input
                     value={form.occupation}
                     onChange={(e) => setForm({ ...form, occupation: e.target.value })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
@@ -432,7 +576,7 @@ export function TenantsPage() {
                     value={form.companyOrCollege}
                     onChange={(e) => setForm({ ...form, companyOrCollege: e.target.value })}
                     placeholder="e.g., Infosys / Christ Univ"
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
               </div>
@@ -440,12 +584,15 @@ export function TenantsPage() {
 
             {step === 2 && (
               <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">
+                  All fields in this step are optional. The resident can also add or update ID verification, permanent address, and emergency contacts anytime from their Tenant Portal profile.
+                </div>
                 <div>
-                  <label className="block text-xs font-medium">ID Document Type</label>
+                  <label className="block text-xs font-medium">ID Document Type (Optional)</label>
                   <select
                     value={form.idType}
                     onChange={(e) => setForm({ ...form, idType: e.target.value as any })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   >
                     <option value="Aadhaar">Aadhaar Card</option>
                     <option value="PAN">PAN Card</option>
@@ -455,22 +602,21 @@ export function TenantsPage() {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium">Masked ID Number *</label>
+                  <label className="block text-xs font-medium">Masked ID Number (Optional)</label>
                   <input
-                    required
                     value={form.idNumberMasked}
                     onChange={(e) => setForm({ ...form, idNumberMasked: e.target.value })}
-                    placeholder={form.idType === 'Aadhaar' ? 'XXXX-XXXX-4512' : 'Enter ID reference'}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    placeholder={form.idType === 'Aadhaar' ? 'XXXX-XXXX-4512' : 'Optional ID reference'}
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 {form.idType === 'Aadhaar' && (
                   <div className="sm:col-span-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-                    UIDAI Compliance: Upload a <strong>Masked Aadhaar</strong> (downloaded from myAadhaar) with the first 8 digits hidden, and enter only <span className="font-mono">XXXX-XXXX-1234</span>. Full 12-digit Aadhaar numbers are rejected.
+                    UIDAI Compliance: If entering Aadhaar, upload a <strong>Masked Aadhaar</strong> and enter only <span className="font-mono">XXXX-XXXX-1234</span>. Full 12-digit Aadhaar numbers are rejected.
                   </div>
                 )}
                 <div className="sm:col-span-2">
-                  <label className="block text-xs font-medium">Upload ID Scan (Private Vault, max 5 MB)</label>
+                  <label className="block text-xs font-medium">Upload ID Scan (Optional, max 5 MB)</label>
                   <div className="mt-1 flex items-center gap-3">
                     <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800">
                       <Upload className="h-3.5 w-3.5" />
@@ -485,32 +631,30 @@ export function TenantsPage() {
                   </div>
                 </div>
                 <div className="sm:col-span-2">
-                  <label className="block text-xs font-medium">Permanent Address *</label>
+                  <label className="block text-xs font-medium">Permanent Address (Optional)</label>
                   <input
-                    required
                     value={form.permanentAddress}
                     onChange={(e) => setForm({ ...form, permanentAddress: e.target.value })}
                     placeholder="Home address with city & state"
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium">Emergency Contact Name *</label>
+                  <label className="block text-xs font-medium">Emergency Contact Name (Optional)</label>
                   <input
-                    required
                     value={form.emergencyContactName}
                     onChange={(e) => setForm({ ...form, emergencyContactName: e.target.value })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    placeholder="Parent / Guardian name"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium">Emergency Contact Phone *</label>
+                  <label className="block text-xs font-medium">Emergency Contact Phone (Optional)</label>
                   <input
-                    required
                     value={form.emergencyContactPhone}
                     onChange={(e) => setForm({ ...form, emergencyContactPhone: e.target.value })}
-                    placeholder="9820011223"
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    placeholder="+91 98765 43210"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
               </div>
@@ -523,7 +667,7 @@ export function TenantsPage() {
                   <select
                     value={form.propertyId}
                     onChange={(e) => setForm({ ...form, propertyId: Number(e.target.value), bedId: 0 })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   >
                     {properties.map((p) => (
                       <option key={p.id} value={p.id}>
@@ -551,7 +695,7 @@ export function TenantsPage() {
                           securityDeposit: (chosen?.effectiveRent || form.monthlyRent) * 2,
                         });
                       }}
-                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                     >
                       {vacantBeds.map((b) => (
                         <option key={b.id} value={b.id}>
@@ -572,7 +716,7 @@ export function TenantsPage() {
                     type="date"
                     value={form.joinDate}
                     onChange={(e) => setForm({ ...form, joinDate: e.target.value })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
@@ -581,7 +725,7 @@ export function TenantsPage() {
                     type="number"
                     value={form.monthlyRent}
                     onChange={(e) => setForm({ ...form, monthlyRent: Number(e.target.value) })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div>
@@ -590,7 +734,7 @@ export function TenantsPage() {
                     type="number"
                     value={form.securityDeposit}
                     onChange={(e) => setForm({ ...form, securityDeposit: Number(e.target.value) })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </div>
                 <div className="flex items-end pb-2">
@@ -618,11 +762,41 @@ export function TenantsPage() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (step === 2) {
-                      const check = validateMaskedIdNumber(form.idType, form.idNumberMasked);
-                      if (!check.valid) {
-                        showToast(check.message || 'Check ID number format', 'error');
+                    if (step === 1) {
+                      if (!form.name.trim()) {
+                        showToast('Resident full name is required', 'error');
                         return;
+                      }
+                      const hasPhone = form.phone.trim().length > 0;
+                      const hasEmail = form.email.trim().length > 0;
+                      if (!hasPhone && !hasEmail) {
+                        showToast('Provide at least a mobile number or an email address', 'error');
+                        return;
+                      }
+                      if (hasPhone) {
+                        const digits = form.phone.replace(/\D/g, '');
+                        const okPhone = digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+                        if (!okPhone) {
+                          showToast('Enter a valid 10-digit Indian mobile number or leave blank', 'error');
+                          return;
+                        }
+                      }
+                    }
+                    if (step === 2) {
+                      if (form.idNumberMasked.trim().length > 0) {
+                        const check = validateMaskedIdNumber(form.idType, form.idNumberMasked);
+                        if (!check.valid) {
+                          showToast(check.message || 'Check ID number format', 'error');
+                          return;
+                        }
+                      }
+                      if (form.emergencyContactPhone.trim().length > 0) {
+                        const digits = form.emergencyContactPhone.replace(/\D/g, '');
+                        const okPhone = digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+                        if (!okPhone) {
+                          showToast('Enter a valid 10-digit emergency contact phone or leave blank', 'error');
+                          return;
+                        }
                       }
                     }
                     setStep(step + 1);

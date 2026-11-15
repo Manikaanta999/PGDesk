@@ -1,5 +1,7 @@
 import { Router } from 'express';
+import { ne } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
+import { PLATFORM_ORG_SLUG } from '../../lib/platformAuth.ts';
 import { verifyCronSecret } from '../../lib/security.ts';
 import { runBillingCycleForOrg } from '../billingEngine.ts';
 
@@ -30,7 +32,10 @@ cronRouter.post('/daily-billing', async (req, res) => {
     const year = dateMatch ? Number(dateMatch[1]) : fallback.year;
     const month = dateMatch ? Number(dateMatch[2]) : fallback.month;
 
-    const orgs = await db.select().from(schema.organizations);
+    const orgs = await db
+      .select()
+      .from(schema.organizations)
+      .where(ne(schema.organizations.slug, PLATFORM_ORG_SLUG));
     let invoicesCreated = 0;
     let overdueUpdated = 0;
 

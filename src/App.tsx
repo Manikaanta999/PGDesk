@@ -1,7 +1,9 @@
 import React from 'react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { LanguageProvider } from './context/LanguageContext';
 import { ToastProvider } from './context/ToastContext';
+import { AboutPage, ContactPage, PrivacyPolicyPage, TermsPage } from './pages/InfoPages';
 import { LandingPage } from './pages/LandingPage';
 import { LoginPage } from './pages/LoginPage';
 import { PublicListingPage } from './pages/PublicListingPage';
@@ -16,12 +18,13 @@ import { SettingsPage } from './pages/dashboard/SettingsPage';
 import { TenantDetailPage } from './pages/dashboard/TenantDetailPage';
 import { TenantsPage } from './pages/dashboard/TenantsPage';
 import { TenantPortalPage } from './pages/tenant/TenantPortalPage';
+import { AdminDashboardPage } from './pages/admin/AdminDashboardPage';
 
 function RequireRoleRoute({
   allowed,
   children,
 }: {
-  allowed: Array<'OWNER' | 'MANAGER' | 'TENANT'>;
+  allowed: Array<'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT'>;
   children: React.ReactNode;
 }) {
   const { user, loading } = useAuth();
@@ -39,7 +42,8 @@ function RequireRoleRoute({
   }
 
   if (!allowed.includes(user.role)) {
-    return <Navigate to={user.role === 'TENANT' ? '/tenant' : '/dashboard'} replace />;
+    const fallback = user.role === 'ADMIN' ? '/admin' : user.role === 'TENANT' ? '/tenant' : '/dashboard';
+    return <Navigate to={fallback} replace />;
   }
 
   return <>{children}</>;
@@ -49,9 +53,14 @@ export default function App() {
   return (
     <BrowserRouter>
       <ToastProvider>
-        <AuthProvider>
-          <Routes>
+        <LanguageProvider>
+          <AuthProvider>
+            <Routes>
             <Route path="/" element={<LandingPage />} />
+            <Route path="/about" element={<AboutPage />} />
+            <Route path="/contact" element={<ContactPage />} />
+            <Route path="/privacy" element={<PrivacyPolicyPage />} />
+            <Route path="/terms" element={<TermsPage />} />
             <Route path="/login" element={<LoginPage />} />
             <Route path="/pg/:slug" element={<PublicListingPage />} />
 
@@ -137,6 +146,15 @@ export default function App() {
             />
 
             <Route
+              path="/admin"
+              element={
+                <RequireRoleRoute allowed={['ADMIN']}>
+                  <AdminDashboardPage />
+                </RequireRoleRoute>
+              }
+            />
+
+            <Route
               path="/tenant"
               element={
                 <RequireRoleRoute allowed={['TENANT']}>
@@ -146,8 +164,9 @@ export default function App() {
             />
 
             <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-        </AuthProvider>
+            </Routes>
+          </AuthProvider>
+        </LanguageProvider>
       </ToastProvider>
     </BrowserRouter>
   );

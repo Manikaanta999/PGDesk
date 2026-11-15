@@ -8,7 +8,6 @@ import { ImageWithFallback } from '../components/ui/ImageWithFallback';
 import { useToast } from '../context/ToastContext';
 import { apiFetch } from '../lib/api';
 import { formatIndianPhone, formatINR } from '../lib/format';
-import { indianPhoneSchema } from '../lib/validation';
 
 interface RoomSummary {
   roomType: string;
@@ -39,15 +38,34 @@ interface PublicPropertyDetail {
   roomSummary: RoomSummary[];
 }
 
-const formSchema = z.object({
-  name: z.string().trim().min(2, 'Your name is required').max(100),
-  phone: indianPhoneSchema,
-  email: z.string().trim().email('Invalid email').optional().or(z.literal('')),
-  preferredRoomType: z.enum(['SINGLE', 'DOUBLE', 'TRIPLE', 'DORM']),
-  moveInDate: z.string().trim().max(32).optional(),
-  message: z.string().trim().max(600),
-  website: z.string().max(0).optional(),
-});
+const formSchema = z
+  .object({
+    name: z.string().trim().min(2, 'Your name is required').max(100),
+    phone: z
+      .string()
+      .trim()
+      .refine((val) => {
+        if (!val) return true;
+        const digits = val.replace(/\D/g, '');
+        return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+      }, 'Enter a valid 10-digit Indian mobile number'),
+    email: z.string().trim().email('Invalid email').optional().or(z.literal('')),
+    preferredRoomType: z.enum(['SINGLE', 'DOUBLE', 'TRIPLE', 'DORM']),
+    moveInDate: z.string().trim().max(32).optional(),
+    message: z.string().trim().max(600),
+    website: z.string().max(0).optional(),
+  })
+  .superRefine((val, ctx) => {
+    const hasPhone = Boolean(val.phone && val.phone.trim().length > 0);
+    const hasEmail = Boolean(val.email && val.email.trim().length > 0);
+    if (!hasPhone && !hasEmail) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Provide at least a mobile number or an email address.',
+        path: ['phone'],
+      });
+    }
+  });
 type EnquiryFormValues = z.infer<typeof formSchema>;
 
 export function PublicListingPage() {
@@ -372,7 +390,7 @@ export function PublicListingPage() {
                       type="text"
                       placeholder="e.g., Rahul Sharma"
                       {...register('name')}
-                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
                     />
                     {errors.name && <p className="mt-1 text-xs text-red-600">{errors.name.message}</p>}
                   </div>
@@ -386,9 +404,26 @@ export function PublicListingPage() {
                       type="tel"
                       placeholder="9845012345"
                       {...register('phone')}
-                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
                     />
                     {errors.phone && <p className="mt-1 text-xs text-red-600">{errors.phone.message}</p>}
+                  </div>
+
+                  <div>
+                    <label htmlFor="enq-email" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Email Address
+                    </label>
+                    <input
+                      id="enq-email"
+                      type="email"
+                      placeholder="name@example.com"
+                      {...register('email')}
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                    />
+                    <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                      Provide your mobile number or email address (at least one) so the hostel can reach you.
+                    </p>
+                    {errors.email && <p className="mt-1 text-xs text-red-600">{errors.email.message}</p>}
                   </div>
 
                   <div className="grid grid-cols-2 gap-3">
@@ -399,7 +434,7 @@ export function PublicListingPage() {
                       <select
                         id="enq-room"
                         {...register('preferredRoomType')}
-                        className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                        className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
                       >
                         <option value="SINGLE">Single Room</option>
                         <option value="DOUBLE">Double Sharing</option>
@@ -415,7 +450,7 @@ export function PublicListingPage() {
                         id="enq-date"
                         type="date"
                         {...register('moveInDate')}
-                        className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                        className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
                       />
                     </div>
                   </div>
@@ -429,7 +464,7 @@ export function PublicListingPage() {
                       rows={3}
                       placeholder="Preferred visit timing or questions..."
                       {...register('message')}
-                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
                     />
                   </div>
 

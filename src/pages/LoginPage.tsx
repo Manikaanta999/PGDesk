@@ -1,31 +1,58 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { ArrowLeft, LogOut, UserPlus } from 'lucide-react';
+import { ArrowLeft, Eye, EyeOff, LogOut, UserPlus } from 'lucide-react';
+import { LanguageSwitcher } from '../components/ui/LanguageSwitcher';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
-import { indianPhoneSchema, loginSchema } from '../lib/validation';
+import { loginSchema } from '../lib/validation';
 
 type LoginFormValues = z.infer<typeof loginSchema>;
 
 const signupFormSchema = z
   .object({
     accountType: z.enum(['OWNER', 'TENANT']),
+    ownerRegistrationToken: z.string().trim(),
     name: z.string().trim().min(2, 'Full name is required').max(120),
     organizationName: z.string().trim().max(120),
     email: z.string().trim().email('Enter a valid email address'),
-    phone: indianPhoneSchema,
+    phone: z
+      .string()
+      .trim()
+      .refine((val) => {
+        if (!val) return true;
+        const digits = val.replace(/\D/g, '');
+        return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+      }, 'Enter a valid 10-digit Indian mobile number'),
     password: z.string().min(6, 'Password must be at least 6 characters').max(100),
   })
-  .refine(
-    (val) => val.accountType !== 'OWNER' || val.organizationName.trim().length >= 2,
-    {
-      message: 'PG / Business name is required (min 2 characters)',
-      path: ['organizationName'],
+  .superRefine((val, ctx) => {
+    if (val.accountType === 'OWNER') {
+      if (val.organizationName.trim().length < 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'PG / Business name is required (min 2 characters)',
+          path: ['organizationName'],
+        });
+      }
+      if (!val.ownerRegistrationToken || val.ownerRegistrationToken.trim().length < 10) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Valid Owner Registration Token is required',
+          path: ['ownerRegistrationToken'],
+        });
+      }
+      if (!val.phone || val.phone.trim().length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Enter a valid 10-digit Indian mobile number',
+          path: ['phone'],
+        });
+      }
     }
-  );
+  });
 
 type SignupFormValues = z.infer<typeof signupFormSchema>;
 
@@ -35,7 +62,8 @@ export function LoginPage() {
     googleAuthEnabled,
     loginWithCredentials,
     registerAccount,
-    verifyTenantOtp,
+    verifyEmail,
+    resendVerification,
     forgotPassword,
     resetPassword,
     loginWithGoogle,
@@ -44,21 +72,45 @@ export function LoginPage() {
   const { showToast } = useToast();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const [mode, setMode] = useState<'login' | 'register' | 'otp' | 'forgot' | 'reset'>(
-    searchParams.get('mode') === 'register' ? 'register' : 'login'
+  const initialModeParam = searchParams.get('mode');
+  const [mode, setMode] = useState<'login' | 'register' | 'verify-email' | 'forgot' | 'reset'>(
+    initialModeParam === 'register'
+      ? 'register'
+      : initialModeParam === 'forgot'
+        ? 'forgot'
+        : initialModeParam === 'reset'
+          ? 'reset'
+          : initialModeParam === 'verify-email'
+            ? 'verify-email'
+            : 'login'
   );
   const [googleBusy, setGoogleBusy] = useState(false);
 
-  // Tenant OTP verification state
-  const [otpEmail, setOtpEmail] = useState('');
-  const [otpCode, setOtpCode] = useState('');
-  const [verifyingOtp, setVerifyingOtp] = useState(false);
+  // Password visibility toggles
+  const [showLoginPwd, setShowLoginPwd] = useState(false);
+  const [showSignupPwd, setShowSignupPwd] = useState(false);
+  const [showResetPwd, setShowResetPwd] = useState(false);
+  const [showConfirmResetPwd, setShowConfirmResetPwd] = useState(false);
 
-  // Forgot / Reset password state
-  const [resetIdentifier, setResetIdentifier] = useState('');
-  const [resetCode, setResetCode] = useState('');
+  // Email verification state
+  const [verifyEmailAddr, setVerifyEmailAddr] = useState(searchParams.get('email') || '');
+  const [verifyCode, setVerifyCode] = useState('');
+  const [verifyingEmail, setVerifyingEmail] = useState(false);
+  const [resendBusy, setResendBusy] = useState(false);
+
+  // Forgot / Reset password state (email-only)
+  const [resetEmail, setResetEmail] = useState(searchParams.get('email') || searchParams.get('identifier') || '');
+  const [resetCode, setResetCode] = useState(searchParams.get('code') || '');
   const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [resetBusy, setResetBusy] = useState(false);
+
+  useEffect(() => {
+    const m = searchParams.get('mode');
+    if (m === 'register' || m === 'forgot' || m === 'reset' || m === 'login' || m === 'verify-email') {
+      setMode(m);
+    }
+  }, [searchParams]);
 
   const loginForm = useForm<LoginFormValues>({
     resolver: zodResolver(loginSchema),
@@ -68,7 +120,8 @@ export function LoginPage() {
   const signupForm = useForm<SignupFormValues>({
     resolver: zodResolver(signupFormSchema),
     defaultValues: {
-      accountType: 'OWNER',
+      accountType: searchParams.get('role') === 'tenant' ? 'TENANT' : 'OWNER',
+      ownerRegistrationToken: '',
       name: '',
       organizationName: '',
       email: '',
@@ -80,7 +133,13 @@ export function LoginPage() {
   const accountType = signupForm.watch('accountType');
 
   const routeAfterLogin = (role: string) => {
-    navigate(role === 'TENANT' ? '/tenant' : '/dashboard', { replace: true });
+    if (role === 'ADMIN') {
+      navigate('/admin', { replace: true });
+    } else if (role === 'TENANT') {
+      navigate('/tenant', { replace: true });
+    } else {
+      navigate('/dashboard', { replace: true });
+    }
   };
 
   const onLoginSubmit = async (values: LoginFormValues) => {
@@ -89,10 +148,11 @@ export function LoginPage() {
       showToast(`Welcome back, ${u.name}`);
       routeAfterLogin(u.role);
     } catch (err: any) {
-      if (err?.data?.requiresOtp && err?.data?.email) {
-        setOtpEmail(err.data.email);
-        setMode('otp');
-        showToast(err.message || 'Please complete OTP verification', 'info');
+      if (err?.data?.requiresEmailVerification && err?.data?.email) {
+        setVerifyEmailAddr(err.data.email);
+        setVerifyCode('');
+        setMode('verify-email');
+        showToast(err.message || 'Please verify your email address to continue', 'info');
         return;
       }
       showToast(err.message || 'Sign in failed', 'error');
@@ -101,12 +161,20 @@ export function LoginPage() {
 
   const onSignupSubmit = async (values: SignupFormValues) => {
     try {
-      const result = await registerAccount(values);
-      if (result.requiresOtp && result.email) {
-        setOtpEmail(result.email);
-        setOtpCode('');
-        setMode('otp');
-        showToast('Enter the 6-digit OTP sent to verify your resident profile.', 'info');
+      const result = await registerAccount({
+        ...values,
+        ownerRegistrationToken:
+          values.accountType === 'OWNER' ? values.ownerRegistrationToken?.trim() : undefined,
+        phone: values.phone?.trim() || undefined,
+      });
+      if (result.requiresEmailVerification && result.email) {
+        setVerifyEmailAddr(result.email);
+        setVerifyCode('');
+        setMode('verify-email');
+        showToast(
+          result.message || 'Verification code sent to your email. Enter it below to activate your account.',
+          'info'
+        );
         return;
       }
       if (result.user) {
@@ -118,17 +186,30 @@ export function LoginPage() {
     }
   };
 
-  const onVerifyOtpSubmit = async (e: React.FormEvent) => {
+  const onVerifyEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setVerifyingOtp(true);
+    setVerifyingEmail(true);
     try {
-      const u = await verifyTenantOtp(otpEmail, otpCode.trim());
-      showToast(`Verified! Welcome to your Resident Portal, ${u.name}`);
+      const u = await verifyEmail(verifyEmailAddr.trim(), verifyCode.trim());
+      showToast(`Email verified! Welcome to PGDesk, ${u.name}`);
       routeAfterLogin(u.role);
     } catch (err: any) {
-      showToast(err.message || 'Invalid or expired OTP', 'error');
+      showToast(err.message || 'Invalid or expired verification code', 'error');
     } finally {
-      setVerifyingOtp(false);
+      setVerifyingEmail(false);
+    }
+  };
+
+  const onResendVerification = async () => {
+    if (!verifyEmailAddr.trim() || resendBusy) return;
+    setResendBusy(true);
+    try {
+      const res = await resendVerification(verifyEmailAddr.trim());
+      showToast(res.message || 'Verification code sent to your email', 'info');
+    } catch (err: any) {
+      showToast(err.message || 'Could not resend verification code', 'error');
+    } finally {
+      setResendBusy(false);
     }
   };
 
@@ -136,7 +217,7 @@ export function LoginPage() {
     e.preventDefault();
     setResetBusy(true);
     try {
-      const res = await forgotPassword(resetIdentifier.trim());
+      const res = await forgotPassword(resetEmail.trim());
       showToast(res.message, 'info');
       setMode('reset');
     } catch (err: any) {
@@ -148,16 +229,25 @@ export function LoginPage() {
 
   const onResetPasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (newPassword.length < 6) {
+      showToast('New password must be at least 6 characters', 'error');
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      showToast('New password and confirmation do not match', 'error');
+      return;
+    }
     setResetBusy(true);
     try {
       const res = await resetPassword({
-        identifier: resetIdentifier.trim(),
+        email: resetEmail.trim(),
         code: resetCode.trim(),
         newPassword,
       });
       showToast(res.message);
       setResetCode('');
       setNewPassword('');
+      setConfirmNewPassword('');
       setMode('login');
     } catch (err: any) {
       showToast(err.message || 'Could not reset password', 'error');
@@ -188,16 +278,22 @@ export function LoginPage() {
     showToast('Logged out successfully');
   };
 
+  const inputClass =
+    'mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white dark:focus:bg-slate-950';
+
   return (
     <div className="flex min-h-screen flex-col justify-center bg-slate-50 px-4 py-12 dark:bg-slate-950">
       <div className="mx-auto w-full max-w-md">
-        <Link
-          to="/"
-          className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Back to PGDesk Home
-        </Link>
+        <div className="flex items-center justify-between gap-2">
+          <Link
+            to="/"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            <span>Back to PGDesk Home</span>
+          </Link>
+          <LanguageSwitcher compact />
+        </div>
 
         {user && (
           <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-teal-200 bg-teal-50/70 px-4 py-3 text-xs dark:border-teal-900 dark:bg-teal-950/40">
@@ -205,7 +301,7 @@ export function LoginPage() {
               <p className="font-semibold text-teal-900 dark:text-teal-200">
                 Signed in as {user.name}
               </p>
-              <p className="text-teal-700 dark:text-teal-400">
+              <p className="truncate text-teal-700 dark:text-teal-400">
                 {user.role} · {user.email}
               </p>
             </div>
@@ -230,7 +326,6 @@ export function LoginPage() {
         )}
 
         <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-7 shadow-xs dark:border-slate-800 dark:bg-slate-900">
-          {/* Sign In / Create Account Switcher */}
           {(mode === 'login' || mode === 'register') && (
             <div className="grid grid-cols-2 gap-1 rounded-xl border border-slate-200 bg-slate-100 p-1 dark:border-slate-800 dark:bg-slate-950">
               <button
@@ -265,7 +360,7 @@ export function LoginPage() {
                 Sign in to PGDesk
               </h1>
               <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
-                Access Owner operations, Property Manager desk, or Resident Tenant Portal.
+                Open your Hostel Owner, Manager, or Student account.
               </p>
 
               <form onSubmit={loginForm.handleSubmit(onLoginSubmit)} className="mt-6 space-y-4">
@@ -278,7 +373,7 @@ export function LoginPage() {
                     type="text"
                     placeholder="name@company.com or +91 98765 43210"
                     {...loginForm.register('identifier')}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                    className={inputClass}
                   />
                   {loginForm.formState.errors.identifier && (
                     <p className="mt-1 text-xs text-red-600">{loginForm.formState.errors.identifier.message}</p>
@@ -293,7 +388,8 @@ export function LoginPage() {
                     <button
                       type="button"
                       onClick={() => {
-                        setResetIdentifier(loginForm.getValues('identifier') || '');
+                        const typed = loginForm.getValues('identifier') || '';
+                        setResetEmail(typed.includes('@') ? typed : '');
                         setMode('forgot');
                       }}
                       className="text-xs font-medium text-teal-700 hover:underline dark:text-teal-400"
@@ -301,13 +397,23 @@ export function LoginPage() {
                       Forgot password?
                     </button>
                   </div>
-                  <input
-                    id="login-password"
-                    type="password"
-                    placeholder="Enter password"
-                    {...loginForm.register('password')}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-                  />
+                  <div className="relative">
+                    <input
+                      id="login-password"
+                      type={showLoginPwd ? 'text' : 'password'}
+                      placeholder="Enter password"
+                      {...loginForm.register('password')}
+                      className={`${inputClass} pr-10`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowLoginPwd((v) => !v)}
+                      aria-label={showLoginPwd ? 'Hide password' : 'Show password'}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                    >
+                      {showLoginPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
                   {loginForm.formState.errors.password && (
                     <p className="mt-1 text-xs text-red-600">{loginForm.formState.errors.password.message}</p>
                   )}
@@ -327,10 +433,10 @@ export function LoginPage() {
           {mode === 'register' && (
             <>
               <h1 className="mt-5 font-display text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-                Create your PGDesk account
+                Start Using PGDesk
               </h1>
               <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
-                Launch a new PG business workspace or create your Resident portal login.
+                Create your free hostel register account or student login.
               </p>
 
               <form onSubmit={signupForm.handleSubmit(onSignupSubmit)} className="mt-5 space-y-3.5">
@@ -348,7 +454,7 @@ export function LoginPage() {
                           : 'border-slate-200 text-slate-600 dark:border-slate-700 dark:text-slate-300'
                       }`}
                     >
-                      PG Owner / Operator
+                      Hostel / PG Owner
                     </button>
                     <button
                       type="button"
@@ -359,7 +465,7 @@ export function LoginPage() {
                           : 'border-slate-200 text-slate-600 dark:border-slate-700 dark:text-slate-300'
                       }`}
                     >
-                      Resident / Tenant
+                      Student / Tenant
                     </button>
                   </div>
                 </div>
@@ -373,7 +479,7 @@ export function LoginPage() {
                     type="text"
                     placeholder="Enter your full name"
                     {...signupForm.register('name')}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                    className={inputClass}
                   />
                   {signupForm.formState.errors.name && (
                     <p className="mt-1 text-xs text-red-600">{signupForm.formState.errors.name.message}</p>
@@ -381,36 +487,59 @@ export function LoginPage() {
                 </div>
 
                 {accountType === 'OWNER' && (
-                  <div>
-                    <label htmlFor="reg-org" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      PG / Hostel Business Name
-                    </label>
-                    <input
-                      id="reg-org"
-                      type="text"
-                      placeholder="e.g., GreenPark Residences"
-                      {...signupForm.register('organizationName')}
-                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-                    />
-                    {signupForm.formState.errors.organizationName && (
-                      <p className="mt-1 text-xs text-red-600">
-                        {signupForm.formState.errors.organizationName.message}
+                  <>
+                    <div>
+                      <label htmlFor="reg-token" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                        Owner Registration Token *
+                      </label>
+                      <input
+                        id="reg-token"
+                        type="text"
+                        placeholder="PGDESKOWNER-XXXX-XXXX-XXXX"
+                        {...signupForm.register('ownerRegistrationToken')}
+                        className={`${inputClass} font-mono uppercase`}
+                      />
+                      <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                        Single-use onboarding token issued by PGDesk platform admin.
                       </p>
-                    )}
-                  </div>
+                      {signupForm.formState.errors.ownerRegistrationToken && (
+                        <p className="mt-1 text-xs text-red-600">
+                          {signupForm.formState.errors.ownerRegistrationToken.message}
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <label htmlFor="reg-org" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                        PG / Hostel Business Name *
+                      </label>
+                      <input
+                        id="reg-org"
+                        type="text"
+                        placeholder="e.g., GreenPark Residences"
+                        {...signupForm.register('organizationName')}
+                        className={inputClass}
+                      />
+                      {signupForm.formState.errors.organizationName && (
+                        <p className="mt-1 text-xs text-red-600">
+                          {signupForm.formState.errors.organizationName.message}
+                        </p>
+                      )}
+                    </div>
+                  </>
                 )}
 
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div>
                     <label htmlFor="reg-email" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Email Address
+                      Email Address *
                     </label>
                     <input
                       id="reg-email"
                       type="email"
                       placeholder="name@company.com"
                       {...signupForm.register('email')}
-                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                      className={inputClass}
                     />
                     {signupForm.formState.errors.email && (
                       <p className="mt-1 text-xs text-red-600">{signupForm.formState.errors.email.message}</p>
@@ -419,14 +548,14 @@ export function LoginPage() {
 
                   <div>
                     <label htmlFor="reg-phone" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Mobile Number
+                      Mobile Number {accountType === 'TENANT' ? '(Optional)' : '*'}
                     </label>
                     <input
                       id="reg-phone"
                       type="tel"
                       placeholder="+91 98765 43210"
                       {...signupForm.register('phone')}
-                      className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                      className={inputClass}
                     />
                     {signupForm.formState.errors.phone && (
                       <p className="mt-1 text-xs text-red-600">{signupForm.formState.errors.phone.message}</p>
@@ -438,13 +567,23 @@ export function LoginPage() {
                   <label htmlFor="reg-password" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
                     Password (min 6 characters)
                   </label>
-                  <input
-                    id="reg-password"
-                    type="password"
-                    placeholder="Create a strong password"
-                    {...signupForm.register('password')}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-teal-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-                  />
+                  <div className="relative">
+                    <input
+                      id="reg-password"
+                      type={showSignupPwd ? 'text' : 'password'}
+                      placeholder="Create a strong password"
+                      {...signupForm.register('password')}
+                      className={`${inputClass} pr-10`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowSignupPwd((v) => !v)}
+                      aria-label={showSignupPwd ? 'Hide password' : 'Show password'}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                    >
+                      {showSignupPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
                   {signupForm.formState.errors.password && (
                     <p className="mt-1 text-xs text-red-600">{signupForm.formState.errors.password.message}</p>
                   )}
@@ -461,44 +600,71 @@ export function LoginPage() {
             </>
           )}
 
-          {mode === 'otp' && (
-            <form onSubmit={onVerifyOtpSubmit} className="space-y-4">
+          {mode === 'verify-email' && (
+            <form onSubmit={onVerifyEmailSubmit} className="space-y-4">
               <h1 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-                Verify Resident Profile Ownership
+                Verify Your Email Address
               </h1>
               <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                Your details matched an active resident profile. Enter the 6-digit OTP sent to{' '}
-                <strong className="text-slate-900 dark:text-slate-200">{otpEmail}</strong> before linking your portal account.
+                Enter the 6-digit verification code sent to{' '}
+                <strong className="text-slate-900 dark:text-slate-200">{verifyEmailAddr || 'your email'}</strong> to
+                activate your PGDesk account.
               </p>
+              {!verifyEmailAddr && (
+                <div>
+                  <label htmlFor="verify-email-addr" className="block text-xs font-medium">
+                    Email Address
+                  </label>
+                  <input
+                    id="verify-email-addr"
+                    type="email"
+                    required
+                    value={verifyEmailAddr}
+                    onChange={(e) => setVerifyEmailAddr(e.target.value)}
+                    placeholder="name@company.com"
+                    className={inputClass}
+                  />
+                </div>
+              )}
               <div>
-                <label htmlFor="otp-input" className="block text-xs font-medium">
-                  6-Digit OTP Code
+                <label htmlFor="verify-email-code" className="block text-xs font-medium">
+                  6-Digit Email Verification Code
                 </label>
                 <input
-                  id="otp-input"
+                  id="verify-email-code"
                   required
                   maxLength={6}
                   pattern="\d{6}"
-                  value={otpCode}
-                  onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  value={verifyCode}
+                  onChange={(e) => setVerifyCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                   placeholder="Enter 6-digit code"
                   className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 font-mono text-base tracking-widest focus:border-teal-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
                 />
               </div>
               <button
                 type="submit"
-                disabled={verifyingOtp || otpCode.length !== 6}
+                disabled={verifyingEmail || verifyCode.length !== 6}
                 className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
               >
-                {verifyingOtp ? 'Verifying...' : 'Verify & Open Resident Portal'}
+                {verifyingEmail ? 'Verifying...' : 'Verify Email & Continue'}
               </button>
-              <button
-                type="button"
-                onClick={() => setMode('login')}
-                className="w-full text-center text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white"
-              >
-                Back to Sign In
-              </button>
+              <div className="flex items-center justify-between gap-2 pt-1 text-xs">
+                <button
+                  type="button"
+                  disabled={resendBusy || !verifyEmailAddr.trim()}
+                  onClick={onResendVerification}
+                  className="font-medium text-teal-700 hover:underline disabled:opacity-50 dark:text-teal-400"
+                >
+                  {resendBusy ? 'Sending...' : 'Resend verification code'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode('login')}
+                  className="font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white"
+                >
+                  Back to Sign In
+                </button>
+              </div>
             </form>
           )}
 
@@ -508,19 +674,20 @@ export function LoginPage() {
                 Reset Password
               </h1>
               <p className="text-xs text-slate-600 dark:text-slate-400">
-                Enter your registered email or 10-digit mobile number to receive a 6-digit password reset code.
+                Enter your registered email address to receive a 6-digit password reset code.
               </p>
               <div>
-                <label htmlFor="forgot-id" className="block text-xs font-medium">
-                  Email or Mobile Number
+                <label htmlFor="forgot-email" className="block text-xs font-medium">
+                  Registered Email Address
                 </label>
                 <input
-                  id="forgot-id"
+                  id="forgot-email"
+                  type="email"
                   required
-                  value={resetIdentifier}
-                  onChange={(e) => setResetIdentifier(e.target.value)}
-                  placeholder="name@company.com or +91 98765 43210"
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm focus:border-teal-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+                  value={resetEmail}
+                  onChange={(e) => setResetEmail(e.target.value)}
+                  placeholder="name@company.com"
+                  className={inputClass}
                 />
               </div>
               <button
@@ -528,8 +695,14 @@ export function LoginPage() {
                 disabled={resetBusy}
                 className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
               >
-                {resetBusy ? 'Sending code...' : 'Send Reset Code'}
+                {resetBusy ? 'Sending code...' : 'Send Email Reset Code'}
               </button>
+              {googleAuthEnabled && (
+                <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-400">
+                  Signed up with Google? Go back, click <strong>Continue with Google</strong>, and set or reset your
+                  password anytime under <strong>Account &amp; Security</strong>.
+                </p>
+              )}
               <button
                 type="button"
                 onClick={() => setMode('login')}
@@ -543,8 +716,25 @@ export function LoginPage() {
           {mode === 'reset' && (
             <form onSubmit={onResetPasswordSubmit} className="space-y-4">
               <h1 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-                Enter Reset Code &amp; New Password
+                Set New Password
               </h1>
+              <p className="text-xs text-slate-600 dark:text-slate-400">
+                Enter the 6-digit code sent to your email and choose a new password for your account.
+              </p>
+              <div>
+                <label htmlFor="reset-email" className="block text-xs font-medium">
+                  Registered Email Address
+                </label>
+                <input
+                  id="reset-email"
+                  type="email"
+                  required
+                  value={resetEmail}
+                  onChange={(e) => setResetEmail(e.target.value)}
+                  placeholder="name@company.com"
+                  className={inputClass}
+                />
+              </div>
               <div>
                 <label htmlFor="reset-code" className="block text-xs font-medium">
                   6-Digit Reset Code
@@ -563,15 +753,54 @@ export function LoginPage() {
                 <label htmlFor="reset-new-pwd" className="block text-xs font-medium">
                   New Password (min 6 characters)
                 </label>
-                <input
-                  id="reset-new-pwd"
-                  type="password"
-                  required
-                  minLength={6}
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm focus:border-teal-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-                />
+                <div className="relative">
+                  <input
+                    id="reset-new-pwd"
+                    type={showResetPwd ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="Enter new password"
+                    className={`${inputClass} pr-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowResetPwd((v) => !v)}
+                    aria-label={showResetPwd ? 'Hide password' : 'Show password'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                  >
+                    {showResetPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label htmlFor="reset-confirm-pwd" className="block text-xs font-medium">
+                  Confirm New Password
+                </label>
+                <div className="relative">
+                  <input
+                    id="reset-confirm-pwd"
+                    type={showConfirmResetPwd ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={confirmNewPassword}
+                    onChange={(e) => setConfirmNewPassword(e.target.value)}
+                    placeholder="Re-enter new password"
+                    className={`${inputClass} pr-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowConfirmResetPwd((v) => !v)}
+                    aria-label={showConfirmResetPwd ? 'Hide password' : 'Show password'}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                  >
+                    {showConfirmResetPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+                {confirmNewPassword.length > 0 && newPassword !== confirmNewPassword && (
+                  <p className="mt-1 text-xs text-red-600">Passwords do not match</p>
+                )}
               </div>
               <button
                 type="submit"

@@ -12,7 +12,15 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
 
-export const userRoleEnum = pgEnum('user_role', ['OWNER', 'MANAGER', 'TENANT']);
+export const userRoleEnum = pgEnum('user_role', ['ADMIN', 'OWNER', 'MANAGER', 'TENANT']);
+export const ownerTokenStatusEnum = pgEnum('owner_token_status', ['UNUSED', 'USED', 'EXPIRED', 'REVOKED']);
+export const accountLinkStatusEnum = pgEnum('account_link_status', [
+  'NO_ACCOUNT',
+  'ACCOUNT_CREATED',
+  'LINK_PENDING',
+  'LINKED',
+  'LINK_REJECTED',
+]);
 export const genderTypeEnum = pgEnum('gender_type', ['BOYS', 'GIRLS', 'COED']);
 export const billingModeEnum = pgEnum('billing_mode', ['FIXED_1ST', 'JOIN_DATE']);
 export const roomTypeEnum = pgEnum('room_type', ['SINGLE', 'DOUBLE', 'TRIPLE', 'DORM']);
@@ -53,11 +61,11 @@ export const complaintCategoryEnum = pgEnum('complaint_category', [
 export const complaintPriorityEnum = pgEnum('complaint_priority', ['LOW', 'MEDIUM', 'HIGH', 'URGENT']);
 export const complaintStatusEnum = pgEnum('complaint_status', ['OPEN', 'IN_PROGRESS', 'RESOLVED']);
 export const enquiryStatusEnum = pgEnum('enquiry_status', [
-  'NEW',
+  'NEW_ENQUIRY',
   'CONTACTED',
-  'VISIT_SCHEDULED',
-  'CONVERTED',
-  'LOST',
+  'APPROVED',
+  'REJECTED',
+  'CONVERTED_TO_STUDENT',
 ]);
 
 export interface InvoiceLineItem {
@@ -65,6 +73,20 @@ export interface InvoiceLineItem {
   type: 'RENT' | 'ELECTRICITY' | 'FOOD' | 'LATE_FEE' | 'OTHER';
   amount: number;
 }
+
+export interface UserNotificationPrefs {
+  hostelNotices: boolean;
+  rentReminders: boolean;
+  complaintUpdates: boolean;
+  securityAlerts: boolean;
+}
+
+export const DEFAULT_NOTIFICATION_PREFS: UserNotificationPrefs = {
+  hostelNotices: true,
+  rentReminders: true,
+  complaintUpdates: true,
+  securityAlerts: true,
+};
 
 export const organizations = pgTable(
   'organizations',
@@ -88,6 +110,8 @@ export const organizations = pgTable(
     phone: text('phone').notNull().default('+91 98450 11223'),
     email: text('email').notNull().default('ops@pgdesk.in'),
     address: text('address').notNull().default('Bengaluru, Karnataka'),
+    bankDetails: text('bank_details').notNull().default(''),
+    paymentInstructions: text('payment_instructions').notNull().default(''),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
@@ -105,11 +129,27 @@ export const users = pgTable(
     name: text('name').notNull(),
     email: text('email').notNull(),
     phone: text('phone'),
+    photoUrl: text('photo_url'),
     passwordHash: text('password_hash'),
     role: userRoleEnum('role').notNull().default('OWNER'),
     assignedPropertyIds: jsonb('assigned_property_ids').$type<number[]>().notNull().default([]),
     isActive: boolean('is_active').notNull().default(true),
     emailVerified: boolean('email_verified').notNull().default(true),
+    phoneVerified: boolean('phone_verified').notNull().default(false),
+    emailVerificationTokenHash: text('email_verification_token_hash'),
+    emailVerificationExpiresAt: timestamp('email_verification_expires_at'),
+    tokenVersion: integer('token_version').notNull().default(1),
+    lastLoginAt: timestamp('last_login_at'),
+    notificationPrefs: jsonb('notification_prefs')
+      .$type<UserNotificationPrefs>()
+      .notNull()
+      .default(DEFAULT_NOTIFICATION_PREFS),
+    pendingEmail: text('pending_email'),
+    pendingEmailCodeHash: text('pending_email_code_hash'),
+    pendingEmailExpiresAt: timestamp('pending_email_expires_at'),
+    pendingPhone: text('pending_phone'),
+    pendingPhoneCodeHash: text('pending_phone_code_hash'),
+    pendingPhoneExpiresAt: timestamp('pending_phone_expires_at'),
     otpCodeHash: text('otp_code_hash'),
     otpExpiresAt: timestamp('otp_expires_at'),
     resetTokenHash: text('reset_token_hash'),
@@ -121,6 +161,49 @@ export const users = pgTable(
     index('users_org_idx').on(table.organizationId),
     uniqueIndex('users_email_idx').on(table.email),
     index('users_phone_idx').on(table.phone),
+  ]
+);
+
+export const ownerRegistrationTokens = pgTable(
+  'owner_registration_tokens',
+  {
+    id: serial('id').primaryKey(),
+    tokenHash: text('token_hash').notNull(),
+    tokenLast4: text('token_last4').notNull(),
+    note: text('note').notNull().default(''),
+    status: ownerTokenStatusEnum('status').notNull().default('UNUSED'),
+    expiresAt: timestamp('expires_at').notNull(),
+    createdByUserId: integer('created_by_user_id').references(() => users.id),
+    usedByUserId: integer('used_by_user_id').references(() => users.id),
+    usedByOrganizationId: integer('used_by_organization_id').references(() => organizations.id),
+    usedAt: timestamp('used_at'),
+    revokedByUserId: integer('revoked_by_user_id').references(() => users.id),
+    revokedAt: timestamp('revoked_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('owner_reg_tokens_hash_idx').on(table.tokenHash),
+    index('owner_reg_tokens_status_idx').on(table.status),
+  ]
+);
+
+export const userSessions = pgTable(
+  'user_sessions',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id')
+      .references(() => users.id)
+      .notNull(),
+    sessionId: text('session_id').notNull(),
+    userAgent: text('user_agent').notNull().default('Web Browser'),
+    ipAddress: text('ip_address').notNull().default(''),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
+    revokedAt: timestamp('revoked_at'),
+  },
+  (table) => [
+    index('user_sessions_user_idx').on(table.userId),
+    uniqueIndex('user_sessions_sid_idx').on(table.sessionId),
   ]
 );
 
@@ -248,17 +331,26 @@ export const tenants = pgTable(
       .notNull(),
     bedId: integer('bed_id').references(() => beds.id),
     userId: integer('user_id').references(() => users.id),
+    accountLinkStatus: accountLinkStatusEnum('account_link_status').notNull().default('NO_ACCOUNT'),
+    linkCodeHash: text('link_code_hash'),
+    linkCodeExpiresAt: timestamp('link_code_expires_at'),
+    linkRequestedByUserId: integer('link_requested_by_user_id').references(() => users.id),
+    linkRequestedAt: timestamp('link_requested_at'),
+    linkedAt: timestamp('linked_at'),
     name: text('name').notNull(),
-    phone: text('phone').notNull(),
+    phone: text('phone'),
     email: text('email'),
     photoUrl: text('photo_url'),
+    dateOfBirth: text('date_of_birth'),
     idType: text('id_type').notNull().default('Aadhaar'),
-    idNumberMasked: text('id_number_masked').notNull().default('XXXX-XXXX-0000'),
+    idNumberMasked: text('id_number_masked').notNull().default(''),
     idDocumentUrl: text('id_document_url'),
+    kycVerifiedStatus: text('kyc_verified_status').notNull().default('PENDING'),
     occupation: text('occupation').notNull().default('Software Engineer'),
     companyOrCollege: text('company_or_college').notNull().default(''),
     permanentAddress: text('permanent_address').notNull().default(''),
     emergencyContactName: text('emergency_contact_name').notNull().default(''),
+    emergencyContactRelation: text('emergency_contact_relation').notNull().default(''),
     emergencyContactPhone: text('emergency_contact_phone').notNull().default(''),
     joinDate: text('join_date').notNull(), // YYYY-MM-DD
     leaveDate: text('leave_date'), // YYYY-MM-DD
@@ -279,6 +371,7 @@ export const tenants = pgTable(
     index('tenants_bed_idx').on(table.bedId),
     index('tenants_status_idx').on(table.status),
     index('tenants_user_idx').on(table.userId),
+    index('tenants_link_status_idx').on(table.accountLinkStatus),
   ]
 );
 
@@ -465,12 +558,12 @@ export const enquiries = pgTable(
       .references(() => properties.id)
       .notNull(),
     name: text('name').notNull(),
-    phone: text('phone').notNull(),
+    phone: text('phone'),
     email: text('email'),
     preferredRoomType: text('preferred_room_type').notNull().default('DOUBLE'),
     moveInDate: text('move_in_date'),
     message: text('message').notNull().default(''),
-    status: enquiryStatusEnum('status').notNull().default('NEW'),
+    status: enquiryStatusEnum('status').notNull().default('NEW_ENQUIRY'),
     source: text('source').notNull().default('PUBLIC_LISTING'),
     notes: text('notes').notNull().default(''),
     createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -524,6 +617,36 @@ export const uploadedFiles = pgTable(
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => [index('uploaded_files_org_idx').on(table.organizationId)]
+);
+
+export const moveOutRequests = pgTable(
+  'move_out_requests',
+  {
+    id: serial('id').primaryKey(),
+    organizationId: integer('organization_id')
+      .references(() => organizations.id)
+      .notNull(),
+    propertyId: integer('property_id')
+      .references(() => properties.id)
+      .notNull(),
+    tenantId: integer('tenant_id')
+      .references(() => tenants.id)
+      .notNull(),
+    requestedLeaveDate: text('requested_leave_date').notNull(),
+    reason: text('reason').notNull().default(''),
+    notes: text('notes').notNull().default(''),
+    status: text('status').notNull().default('SUBMITTED'), // SUBMITTED | UNDER_REVIEW | APPROVED | REJECTED
+    ownerNote: text('owner_note').notNull().default(''),
+    reviewedByUserId: integer('reviewed_by_user_id').references(() => users.id),
+    reviewedAt: timestamp('reviewed_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('move_out_requests_org_idx').on(table.organizationId),
+    index('move_out_requests_tenant_idx').on(table.tenantId),
+    index('move_out_requests_status_idx').on(table.status),
+  ]
 );
 
 // Relations
@@ -629,5 +752,20 @@ export const complaintCommentsRelations = relations(complaintComments, ({ one })
   complaint: one(complaints, {
     fields: [complaintComments.complaintId],
     references: [complaints.id],
+  }),
+}));
+
+export const ownerRegistrationTokensRelations = relations(ownerRegistrationTokens, ({ one }) => ({
+  createdBy: one(users, {
+    fields: [ownerRegistrationTokens.createdByUserId],
+    references: [users.id],
+  }),
+  usedBy: one(users, {
+    fields: [ownerRegistrationTokens.usedByUserId],
+    references: [users.id],
+  }),
+  usedByOrganization: one(organizations, {
+    fields: [ownerRegistrationTokens.usedByOrganizationId],
+    references: [organizations.id],
   }),
 }));

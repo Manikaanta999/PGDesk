@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { and, count, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
-import { PLAN_LIMITS, PlanTier } from '../../lib/billing.ts';
+import { getActiveEntitlement, SUBSCRIPTIONS_ENABLED } from '../../lib/entitlements.ts';
 import { formatMonthYear } from '../../lib/format.ts';
 import { hashPassword } from '../../lib/security.ts';
 import { storageService } from '../../lib/storage.ts';
@@ -36,7 +36,7 @@ operationsRouter.get('/complaints', requireAuth, requireRole('OWNER', 'MANAGER')
     const allowedIds = getAllowedPropertyIds(user, orgProps.map((p) => p.id));
     if (allowedIds.length === 0) return res.json({ complaints: [], staff: [] });
 
-    const [rows, tenants, staff, comments] = await Promise.all([
+    const [rows, tenants, beds, rooms, staff, comments] = await Promise.all([
       db
         .select()
         .from(schema.complaints)
@@ -48,6 +48,8 @@ operationsRouter.get('/complaints', requireAuth, requireRole('OWNER', 'MANAGER')
         )
         .orderBy(desc(schema.complaints.createdAt)),
       db.select().from(schema.tenants).where(eq(schema.tenants.organizationId, user.organizationId)),
+      db.select().from(schema.beds).where(eq(schema.beds.organizationId, user.organizationId)),
+      db.select().from(schema.rooms).where(eq(schema.rooms.organizationId, user.organizationId)),
       db
         .select({
           id: schema.users.id,
@@ -65,16 +67,25 @@ operationsRouter.get('/complaints', requireAuth, requireRole('OWNER', 'MANAGER')
 
     const propMap = new Map(orgProps.map((p) => [p.id, p]));
     const tenantMap = new Map(tenants.map((t) => [t.id, t]));
+    const bedMap = new Map(beds.map((b) => [b.id, b]));
+    const roomMap = new Map(rooms.map((r) => [r.id, r]));
     const staffMap = new Map(staff.map((s) => [s.id, s]));
 
-    const enriched = rows.map((c) => ({
-      ...c,
-      propertyName: propMap.get(c.propertyId)?.name || '',
-      tenantName: tenantMap.get(c.tenantId)?.name || 'Resident',
-      tenantPhone: tenantMap.get(c.tenantId)?.phone || '',
-      assignedToName: c.assignedToUserId ? staffMap.get(c.assignedToUserId)?.name || null : null,
-      comments: comments.filter((cm) => cm.complaintId === c.id),
-    }));
+    const enriched = rows.map((c) => {
+      const tenant = tenantMap.get(c.tenantId);
+      const bed = tenant?.bedId ? bedMap.get(tenant.bedId) : undefined;
+      const room = bed ? roomMap.get(bed.roomId) : undefined;
+      return {
+        ...c,
+        propertyName: propMap.get(c.propertyId)?.name || '',
+        tenantName: tenant?.name || 'Resident',
+        tenantPhone: tenant?.phone || '',
+        roomNumber: room?.roomNumber || '',
+        bedLabel: bed?.bedLabel || '',
+        assignedToName: c.assignedToUserId ? staffMap.get(c.assignedToUserId)?.name || null : null,
+        comments: comments.filter((cm) => cm.complaintId === c.id),
+      };
+    });
 
     return res.json({
       complaints: enriched,
@@ -271,11 +282,25 @@ operationsRouter.patch('/notices/:id', requireAuth, requireRole('OWNER', 'MANAGE
       .where(and(eq(schema.notices.id, id), eq(schema.notices.organizationId, user.organizationId)))
       .limit(1);
     if (!existing) return res.status(404).json({ error: 'Notice not found' });
+    if (existing.propertyId && !canAccessProperty(user, existing.propertyId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const parsed = createNoticeSchema.partial().safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid notice update' });
+    }
+    if (parsed.data.propertyId && !canAccessProperty(user, parsed.data.propertyId)) {
+      return res.status(403).json({ error: 'Access denied to target property' });
+    }
 
     const [updated] = await db
       .update(schema.notices)
       .set({
-        pinned: typeof req.body?.pinned === 'boolean' ? req.body.pinned : existing.pinned,
+        title: parsed.data.title ?? existing.title,
+        body: parsed.data.body ?? existing.body,
+        propertyId: parsed.data.propertyId !== undefined ? parsed.data.propertyId : existing.propertyId,
+        pinned: parsed.data.pinned !== undefined ? parsed.data.pinned : existing.pinned,
         updatedAt: new Date(),
       })
       .where(eq(schema.notices.id, id))
@@ -292,6 +317,16 @@ operationsRouter.delete('/notices/:id', requireAuth, requireRole('OWNER', 'MANAG
   try {
     const user = req.user!;
     const id = Number(req.params.id);
+    const [existing] = await db
+      .select()
+      .from(schema.notices)
+      .where(and(eq(schema.notices.id, id), eq(schema.notices.organizationId, user.organizationId)))
+      .limit(1);
+    if (!existing) return res.status(404).json({ error: 'Notice not found' });
+    if (existing.propertyId && !canAccessProperty(user, existing.propertyId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     await db
       .delete(schema.notices)
       .where(and(eq(schema.notices.id, id), eq(schema.notices.organizationId, user.organizationId)));
@@ -481,9 +516,29 @@ operationsRouter.post('/expenses', requireAuth, requireRole('OWNER', 'MANAGER'),
 operationsRouter.get('/reports/pnl.csv', requireAuth, requireRole('OWNER', 'MANAGER'), async (req: AuthRequest, res) => {
   try {
     const user = req.user!;
+    const propertyId = req.query.propertyId ? Number(req.query.propertyId) : null;
+    const props = await db
+      .select()
+      .from(schema.properties)
+      .where(and(eq(schema.properties.organizationId, user.organizationId), isNull(schema.properties.deletedAt)));
+    const allowedIds = getAllowedPropertyIds(user, props.map((p) => p.id));
+    const targetIds = propertyId && allowedIds.includes(propertyId) ? [propertyId] : allowedIds;
+
+    if (targetIds.length === 0) {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="pgdesk-pnl-report.csv"');
+      return res.send('Month,Collected Rent (INR),Total Expenses (INR),Net Operating Profit (INR)');
+    }
+
     const [expenseRows, invoiceRows] = await Promise.all([
-      db.select().from(schema.expenses).where(eq(schema.expenses.organizationId, user.organizationId)),
-      db.select().from(schema.invoices).where(eq(schema.invoices.organizationId, user.organizationId)),
+      db
+        .select()
+        .from(schema.expenses)
+        .where(and(eq(schema.expenses.organizationId, user.organizationId), inArray(schema.expenses.propertyId, targetIds))),
+      db
+        .select()
+        .from(schema.invoices)
+        .where(and(eq(schema.invoices.organizationId, user.organizationId), inArray(schema.invoices.propertyId, targetIds))),
     ]);
 
     const monthSet = new Set<string>();
@@ -555,11 +610,11 @@ operationsRouter.get('/settings', requireAuth, requireRole('OWNER', 'MANAGER'), 
       db.select({ total: count() }).from(schema.beds).where(eq(schema.beds.organizationId, user.organizationId)),
     ]);
 
-    const tier = ((org?.planTier || 'GROWTH').toUpperCase() as PlanTier);
-    const limits = PLAN_LIMITS[tier] || PLAN_LIMITS.GROWTH;
+    const limits = getActiveEntitlement(org?.planTier, SUBSCRIPTIONS_ENABLED);
 
     return res.json({
       organization: org,
+      subscriptionsEnabled: SUBSCRIPTIONS_ENABLED,
       quota: {
         propertiesCount: propCountRow?.total ?? 0,
         bedsCount: bedCountRow?.total ?? 0,
@@ -668,7 +723,11 @@ operationsRouter.post('/files/upload', requireAuth, async (req: AuthRequest, res
     const fileName = String(req.body?.fileName || 'document.jpg');
     const mimeType = String(req.body?.mimeType || 'image/jpeg');
     const base64Data = String(req.body?.base64Data || '');
-    const folder = (req.body?.folder || 'id-docs') as 'id-docs' | 'complaints' | 'receipts' | 'properties';
+    const rawFolder = String(req.body?.folder || 'id-docs');
+    const ALLOWED_FOLDERS = ['id-docs', 'complaints', 'receipts', 'properties', 'avatars'] as const;
+    const folder = ALLOWED_FOLDERS.includes(rawFolder as any)
+      ? (rawFolder as (typeof ALLOWED_FOLDERS)[number])
+      : 'id-docs';
 
     if (!base64Data) {
       return res.status(400).json({ error: 'File content is required' });
@@ -720,12 +779,26 @@ operationsRouter.get('/files/:id', requireAuth, async (req: AuthRequest, res) =>
     const [file] = await db
       .select()
       .from(schema.uploadedFiles)
-      .where(and(eq(schema.uploadedFiles.id, fileId), eq(schema.uploadedFiles.organizationId, user.organizationId)))
+      .where(eq(schema.uploadedFiles.id, fileId))
       .limit(1);
 
     if (!file) return res.status(404).json({ error: 'File not found' });
-    if (file.isPrivate && user.role === 'TENANT' && file.ownerUserId !== user.id) {
-      return res.status(403).json({ error: 'Access denied to private ID document' });
+
+    if (user.role !== 'TENANT') {
+      if (file.organizationId !== user.organizationId) {
+        return res.status(404).json({ error: 'File not found' });
+      }
+    } else if (file.isPrivate && file.ownerUserId !== user.id) {
+      const ownTenants = await db
+        .select({ idDocumentUrl: schema.tenants.idDocumentUrl })
+        .from(schema.tenants)
+        .where(and(eq(schema.tenants.userId, user.id), isNull(schema.tenants.deletedAt)));
+      const matches = ownTenants.some((t) => t.idDocumentUrl === `/api/files/${file.id}`);
+      if (!matches) {
+        return res.status(403).json({ error: 'Access denied to private ID document' });
+      }
+    } else if (!file.isPrivate && file.organizationId !== user.organizationId && file.ownerUserId !== user.id) {
+      return res.status(404).json({ error: 'File not found' });
     }
 
     if ((file.provider === 'gcs' || file.provider === 's3') && storageService.getSignedDownloadUrl) {

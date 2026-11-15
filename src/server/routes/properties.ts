@@ -1,8 +1,9 @@
 import { Router } from 'express';
-import { and, asc, count, eq, isNull } from 'drizzle-orm';
+import { and, asc, count, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import { checkPlanBedLimit, checkPlanPropertyLimit } from '../../lib/billing.ts';
 import {
+  addRoomBedsSchema,
   createFloorSchema,
   createPropertySchema,
   createRoomSchema,
@@ -159,9 +160,17 @@ propertiesRouter.patch('/:id', requireAuth, requireRole('OWNER', 'MANAGER'), asy
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid update payload' });
     }
 
+    const updatePayload: Record<string, unknown> = {
+      ...parsed.data,
+      updatedAt: new Date(),
+    };
+    if (parsed.data.contactPhone) {
+      updatePayload.contactPhone = parsed.data.contactPhone.replace(/\D/g, '').slice(-10);
+    }
+
     const [updated] = await db
       .update(schema.properties)
-      .set({ ...parsed.data, updatedAt: new Date() })
+      .set(updatePayload)
       .where(
         and(
           eq(schema.properties.id, propId),
@@ -174,6 +183,14 @@ propertiesRouter.patch('/:id', requireAuth, requireRole('OWNER', 'MANAGER'), asy
     if (!updated) {
       return res.status(404).json({ error: 'Property not found' });
     }
+
+    await logAudit({
+      user,
+      action: 'PROPERTY_UPDATED',
+      entityType: 'PROPERTY',
+      entityId: updated.id,
+      metadata: { name: updated.name },
+    });
 
     return res.json({ property: updated });
   } catch (err) {
@@ -434,6 +451,87 @@ propertiesRouter.post('/:id/rooms', requireAuth, requireRole('OWNER', 'MANAGER')
   }
 });
 
+propertiesRouter.post('/rooms/:roomId/beds', requireAuth, requireRole('OWNER', 'MANAGER'), async (req: AuthRequest, res) => {
+  try {
+    const user = req.user!;
+    const roomId = Number(req.params.roomId);
+    const parsed = addRoomBedsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid bed count' });
+    }
+
+    const [room] = await db
+      .select()
+      .from(schema.rooms)
+      .where(and(eq(schema.rooms.id, roomId), eq(schema.rooms.organizationId, user.organizationId)))
+      .limit(1);
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    if (!canAccessProperty(user, room.propertyId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const [org] = await db
+      .select()
+      .from(schema.organizations)
+      .where(eq(schema.organizations.id, user.organizationId))
+      .limit(1);
+    const [bedCountRow] = await db
+      .select({ total: count() })
+      .from(schema.beds)
+      .where(eq(schema.beds.organizationId, user.organizationId));
+
+    const bedLimit = checkPlanBedLimit({
+      planTier: org?.planTier,
+      currentBeds: bedCountRow?.total ?? 0,
+      bedsToAdd: parsed.data.count,
+    });
+    if (!bedLimit.allowed) {
+      return res.status(403).json({ error: bedLimit.message });
+    }
+
+    const existingBeds = await db
+      .select()
+      .from(schema.beds)
+      .where(and(eq(schema.beds.roomId, room.id), eq(schema.beds.organizationId, user.organizationId)));
+    const usedLabels = new Set(existingBeds.map((b) => b.bedLabel));
+
+    const newLabels: string[] = [];
+    let idx = 0;
+    while (newLabels.length < parsed.data.count && idx < 52) {
+      const suffix = idx < 26 ? String.fromCharCode(65 + idx) : `${Math.floor(idx / 26)}${String.fromCharCode(65 + (idx % 26))}`;
+      const candidate = `${room.roomNumber}-${suffix}`;
+      if (!usedLabels.has(candidate)) {
+        usedLabels.add(candidate);
+        newLabels.push(candidate);
+      }
+      idx++;
+    }
+
+    const createdBeds = await db
+      .insert(schema.beds)
+      .values(
+        newLabels.map((bedLabel) => ({
+          organizationId: user.organizationId,
+          propertyId: room.propertyId,
+          floorId: room.floorId,
+          roomId: room.id,
+          bedLabel,
+          status: 'VACANT' as const,
+          monthlyRentOverride: parsed.data.monthlyRentOverride ?? null,
+        }))
+      )
+      .returning();
+
+    return res.status(201).json({ beds: createdBeds });
+  } catch (err) {
+    console.error('POST /api/properties/rooms/:roomId/beds error:', err);
+    return res.status(500).json({ error: 'Failed to add beds to room' });
+  }
+});
+
 propertiesRouter.patch('/beds/:bedId', requireAuth, requireRole('OWNER', 'MANAGER'), async (req: AuthRequest, res) => {
   try {
     const user = req.user!;
@@ -456,11 +554,32 @@ propertiesRouter.patch('/beds/:bedId', requireAuth, requireRole('OWNER', 'MANAGE
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    if (parsed.data.status !== 'OCCUPIED') {
+      const activeResidents = await db
+        .select({ id: schema.tenants.id, name: schema.tenants.name })
+        .from(schema.tenants)
+        .where(
+          and(
+            eq(schema.tenants.bedId, bedId),
+            eq(schema.tenants.organizationId, user.organizationId),
+            inArray(schema.tenants.status, ['ACTIVE', 'NOTICE']),
+            isNull(schema.tenants.deletedAt)
+          )
+        )
+        .limit(1);
+
+      if (activeResidents[0]) {
+        return res.status(409).json({
+          error: `Bed is currently assigned to ${activeResidents[0].name}. Complete move-out settlement from the student profile to release this bed.`,
+        });
+      }
+    }
+
     const [updated] = await db
       .update(schema.beds)
       .set({
         status: parsed.data.status,
-        notes: parsed.data.notes ?? existing.notes,
+        notes: parsed.data.notes !== undefined ? parsed.data.notes : existing.notes,
         monthlyRentOverride:
           parsed.data.monthlyRentOverride !== undefined
             ? parsed.data.monthlyRentOverride

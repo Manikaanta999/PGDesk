@@ -3,6 +3,7 @@
   "appId": "1:224578670218:web:49bebb8c4927fec6e06773",
   "apiKey": "AIzaSyDuhVo8XxE0wNjIoARTuQ2ySGHOzxn64A8",
   "authDomain": "xenon-complex-86gf7.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-pgdesk-895d56d7-ff8b-4529-9a4d-6712bd2ad590",
   "storageBucket": "xenon-complex-86gf7.firebasestorage.app",
   "messagingSenderId": "224578670218",
   "measurementId": "",

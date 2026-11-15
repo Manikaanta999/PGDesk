@@ -1,14 +1,18 @@
 import { Request, Response, Router } from 'express';
-import { and, eq, isNull, or } from 'drizzle-orm';
+import { and, eq, gt, isNull, or } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import { ensureSeeded } from '../../db/seed.ts';
+import {
+  isValidOwnerTokenFormat,
+  normalizeTokenCode,
+  resolveOwnerTokenStatus,
+} from '../../lib/platformAuth.ts';
 import {
   checkRateLimit,
   generateSixDigitOtp,
   hashPassword,
   hashToken,
   isDemoModeEnabled,
-  signSessionToken,
   verifyPassword,
   verifyTokenHash,
 } from '../../lib/security.ts';
@@ -16,10 +20,17 @@ import {
   forgotPasswordSchema,
   loginSchema,
   registerSchema,
+  resendVerificationSchema,
   resetPasswordSchema,
-  verifyOtpSchema,
+  verifyEmailSchema,
 } from '../../lib/validation.ts';
-import { resolveAuthUser, SESSION_COOKIE_NAME } from '../../middleware/auth.ts';
+import {
+  getCookieOptions,
+  issueUserSession,
+  resolveAuthUser,
+  SESSION_COOKIE_NAME,
+} from '../../middleware/auth.ts';
+import { ensureAdminBootstrapped, ensurePlatformOrg } from '../adminBootstrap.ts';
 import { logAudit } from '../audit.ts';
 
 function toSlug(input: string): string {
@@ -32,60 +43,34 @@ function toSlug(input: string): string {
 
 export const authRouter = Router();
 
-function isCrossOriginIframeRequest(req: Request): boolean {
-  const secFetchDest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
-  if (secFetchDest === 'iframe') return true;
-  const reqHost = req.get('host') || '';
-  const originHeader = req.headers.origin;
-  if (originHeader && reqHost) {
-    try {
-      const originHost = new URL(originHeader).host;
-      if (originHost && originHost !== reqHost) return true;
-    } catch {
-      // Ignore malformed Origin header
-    }
-  }
-  return false;
-}
-
-function getCookieOptions(req: Request) {
-  const isHttps =
-    req.secure ||
-    req.headers['x-forwarded-proto'] === 'https' ||
-    process.env.NODE_ENV === 'production';
-  const isIframe = isCrossOriginIframeRequest(req);
-  const sameSite: 'none' | 'lax' =
-    process.env.NODE_ENV === 'production' && !isIframe
-      ? 'lax'
-      : isHttps && isIframe
-        ? 'none'
-        : isHttps
-          ? 'none'
-          : 'lax';
-
-  return {
-    httpOnly: true,
-    sameSite,
-    secure: Boolean(isHttps),
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    path: '/',
-  };
-}
-
-function shouldUseCookieOnlyAuth(req: Request): boolean {
-  return process.env.NODE_ENV === 'production' && !isCrossOriginIframeRequest(req);
-}
-
-function setSessionCookie(req: Request, res: Response, token: string) {
-  res.cookie(SESSION_COOKIE_NAME, token, getCookieOptions(req));
-}
-
-function normalizePhone10(raw: string): string {
-  const digits = raw.replace(/\D/g, '');
+function normalizePhone10(raw: string | null | undefined): string {
+  const digits = String(raw || '').replace(/\D/g, '');
   if (digits.length === 12 && digits.startsWith('91')) {
     return digits.slice(2);
   }
   return digits.slice(-10);
+}
+
+function serializeSessionUser(u: {
+  id: number;
+  organizationId: number;
+  name: string;
+  email: string;
+  phone: string | null;
+  photoUrl?: string | null;
+  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+  assignedPropertyIds: number[];
+}) {
+  return {
+    id: u.id,
+    organizationId: u.organizationId,
+    name: u.name,
+    email: u.email,
+    phone: u.phone,
+    photoUrl: u.photoUrl ?? null,
+    role: u.role,
+    assignedPropertyIds: Array.isArray(u.assignedPropertyIds) ? u.assignedPropertyIds : [],
+  };
 }
 
 authRouter.get('/config', (_req, res) => {
@@ -95,17 +80,22 @@ authRouter.get('/config', (_req, res) => {
 authRouter.get('/me', async (req, res) => {
   try {
     await ensureSeeded();
+    await ensureAdminBootstrapped();
     const demoModeEnabled = isDemoModeEnabled();
-    const user = await resolveAuthUser(req);
+    const resolved = await resolveAuthUser(req);
+    const user = resolved?.user ?? null;
     if (!user) {
       return res.json({ user: null, demoModeEnabled });
+    }
+    if (user.role === 'ADMIN') {
+      return res.json({ user: serializeSessionUser(user), organization: null, demoModeEnabled });
     }
     const [org] = await db
       .select()
       .from(schema.organizations)
       .where(eq(schema.organizations.id, user.organizationId))
       .limit(1);
-    return res.json({ user, organization: org || null, demoModeEnabled });
+    return res.json({ user: serializeSessionUser(user), organization: org || null, demoModeEnabled });
   } catch (err) {
     console.error('GET /api/auth/me error:', err);
     return res.status(500).json({ error: 'Failed to resolve session' });
@@ -115,6 +105,7 @@ authRouter.get('/me', async (req, res) => {
 authRouter.post('/register', async (req, res) => {
   try {
     await ensureSeeded();
+    await ensureAdminBootstrapped();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`register:${ip}`, 15, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many signup attempts. Please try again shortly.' });
@@ -126,8 +117,10 @@ authRouter.post('/register', async (req, res) => {
     }
 
     const emailLower = parsed.data.email.trim().toLowerCase();
-    const phone10 = normalizePhone10(parsed.data.phone);
+    const rawPhone10 = normalizePhone10(parsed.data.phone);
+    const phone10 = rawPhone10.length === 10 ? rawPhone10 : null;
     const passwordHash = hashPassword(parsed.data.password);
+    const role: 'OWNER' | 'TENANT' = parsed.data.accountType;
 
     const existing = await db
       .select({ id: schema.users.id })
@@ -141,130 +134,176 @@ authRouter.post('/register', async (req, res) => {
       });
     }
 
-    let orgRecord: typeof schema.organizations.$inferSelect | null = null;
-    const role: 'OWNER' | 'TENANT' = parsed.data.accountType;
-    let matchedTenants: Array<typeof schema.tenants.$inferSelect> = [];
+    const verificationCode = generateSixDigitOtp();
+    const verificationExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
     if (role === 'OWNER') {
-      const orgName = parsed.data.organizationName.trim();
-      const baseSlug = toSlug(orgName) || 'pg-group';
-      const uniqueSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
-      const upiHandle = `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`;
+      const normalizedToken = normalizeTokenCode(parsed.data.ownerRegistrationToken);
+      if (!isValidOwnerTokenFormat(normalizedToken)) {
+        return res.status(400).json({
+          error: 'Invalid Owner Registration Token format. Expected PGDESKOWNER-XXXX-XXXX-XXXX.',
+        });
+      }
 
-      const [createdOrg] = await db
-        .insert(schema.organizations)
-        .values({
-          name: orgName,
-          slug: uniqueSlug,
-          upiId: upiHandle,
-          upiPayeeName: orgName,
-          planTier: 'STARTER',
-          phone: `+91 ${phone10.slice(0, 5)} ${phone10.slice(5)}`,
-          email: emailLower,
-          address: 'India',
-        })
-        .returning();
-      orgRecord = createdOrg;
-    } else {
-      matchedTenants = await db
-        .select()
-        .from(schema.tenants)
-        .where(
-          and(
-            isNull(schema.tenants.deletedAt),
-            or(eq(schema.tenants.email, emailLower), eq(schema.tenants.phone, phone10))
+      const tokenHash = hashToken(normalizedToken);
+      const txResult = await db.transaction(async (tx) => {
+        // Atomic single-use redemption: only UNUSED and non-expired tokens can be redeemed once
+        const [redeemedToken] = await tx
+          .update(schema.ownerRegistrationTokens)
+          .set({
+            status: 'USED',
+            usedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(schema.ownerRegistrationTokens.tokenHash, tokenHash),
+              eq(schema.ownerRegistrationTokens.status, 'UNUSED'),
+              gt(schema.ownerRegistrationTokens.expiresAt, new Date())
+            )
           )
-        )
-        .limit(1);
+          .returning();
 
-      if (matchedTenants[0]) {
-        const [matchedOrg] = await db
-          .select()
-          .from(schema.organizations)
-          .where(eq(schema.organizations.id, matchedTenants[0].organizationId))
-          .limit(1);
-        orgRecord = matchedOrg || null;
+        if (!redeemedToken) {
+          const [matched] = await tx
+            .select()
+            .from(schema.ownerRegistrationTokens)
+            .where(eq(schema.ownerRegistrationTokens.tokenHash, tokenHash))
+            .limit(1);
+          if (!matched) {
+            return { errorStatus: 403, errorMessage: 'Invalid Owner Registration Token.' } as const;
+          }
+          const effectiveStatus = resolveOwnerTokenStatus(matched);
+          if (effectiveStatus === 'USED') {
+            return { errorStatus: 403, errorMessage: 'This Owner Registration Token has already been used.' } as const;
+          }
+          if (effectiveStatus === 'REVOKED') {
+            return { errorStatus: 403, errorMessage: 'This Owner Registration Token has been revoked.' } as const;
+          }
+          return { errorStatus: 403, errorMessage: 'This Owner Registration Token has expired.' } as const;
+        }
+
+        const orgName = parsed.data.organizationName.trim();
+        const baseSlug = toSlug(orgName) || 'pg-group';
+        const uniqueSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
+        const upiHandle = `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`;
+
+        const [createdOrg] = await tx
+          .insert(schema.organizations)
+          .values({
+            name: orgName,
+            slug: uniqueSlug,
+            upiId: upiHandle,
+            upiPayeeName: orgName,
+            planTier: 'STARTER',
+            phone: phone10 ? `+91 ${phone10.slice(0, 5)} ${phone10.slice(5)}` : '',
+            email: emailLower,
+            address: 'India',
+          })
+          .returning();
+
+        const [createdUser] = await tx
+          .insert(schema.users)
+          .values({
+            organizationId: createdOrg.id,
+            name: parsed.data.name.trim(),
+            email: emailLower,
+            phone: phone10,
+            passwordHash,
+            role: 'OWNER',
+            assignedPropertyIds: [],
+            isActive: true,
+            emailVerified: false,
+            phoneVerified: false,
+            emailVerificationTokenHash: hashToken(verificationCode),
+            emailVerificationExpiresAt: verificationExpiresAt,
+          })
+          .returning();
+
+        await tx
+          .update(schema.ownerRegistrationTokens)
+          .set({
+            usedByUserId: createdUser.id,
+            usedByOrganizationId: createdOrg.id,
+          })
+          .where(eq(schema.ownerRegistrationTokens.id, redeemedToken.id));
+
+        await tx.insert(schema.auditLogs).values([
+          {
+            organizationId: createdOrg.id,
+            actorUserId: createdUser.id,
+            actorName: createdUser.name,
+            actorRole: 'OWNER',
+            action: 'OWNER_TOKEN_REDEEMED',
+            entityType: 'OWNER_TOKEN',
+            entityId: String(redeemedToken.id),
+            metadata: { tokenLast4: redeemedToken.tokenLast4 },
+          },
+          {
+            organizationId: createdOrg.id,
+            actorUserId: createdUser.id,
+            actorName: createdUser.name,
+            actorRole: 'OWNER',
+            action: 'OWNER_REGISTERED',
+            entityType: 'ORGANIZATION',
+            entityId: String(createdOrg.id),
+            metadata: { organizationName: createdOrg.name },
+          },
+        ]);
+
+        return { ok: true, createdUser, createdOrg } as const;
+      });
+
+      if ('errorStatus' in txResult && txResult.errorStatus) {
+        return res.status(txResult.errorStatus).json({ error: txResult.errorMessage });
       }
 
-      if (!orgRecord) {
-        const [defaultOrg] = await db.select().from(schema.organizations).limit(1);
-        orgRecord = defaultOrg || null;
+      if (process.env.NODE_ENV !== 'production') {
+        console.info(`[PGDesk Email Verification] Owner verification code for ${emailLower}: ${verificationCode}`);
       }
+
+      return res.status(202).json({
+        requiresEmailVerification: true,
+        email: emailLower,
+        message: 'Owner account created. Enter the 6-digit verification code sent to your email address.',
+      });
     }
 
-    if (!orgRecord) {
-      return res.status(400).json({ error: 'No active PG organization found to join. Ask your PG owner to onboard you first.' });
-    }
-
-    // Security check: if a TENANT registers matching an existing owner-created resident profile,
-    // require 6-digit OTP verification before linking the resident record and issuing a session.
-    const requiresOtp = role === 'TENANT' && matchedTenants.length > 0;
-    const otp = requiresOtp ? generateSixDigitOtp() : null;
-
-    const [createdUser] = await db
+    // Student / Tenant self-registration: assign to platform org with zero auto-linked tenant records
+    const platformOrg = await ensurePlatformOrg();
+    const [createdStudent] = await db
       .insert(schema.users)
       .values({
-        organizationId: orgRecord.id,
+        organizationId: platformOrg.id,
         name: parsed.data.name.trim(),
         email: emailLower,
         phone: phone10,
         passwordHash,
-        role,
-        assignedPropertyIds: matchedTenants[0] ? [matchedTenants[0].propertyId] : [],
+        role: 'TENANT',
+        assignedPropertyIds: [],
         isActive: true,
-        emailVerified: !requiresOtp,
-        otpCodeHash: otp ? hashToken(otp) : null,
-        otpExpiresAt: otp ? new Date(Date.now() + 10 * 60 * 1000) : null,
+        emailVerified: false,
+        phoneVerified: false,
+        emailVerificationTokenHash: hashToken(verificationCode),
+        emailVerificationExpiresAt: verificationExpiresAt,
       })
       .returning();
 
-    if (requiresOtp && otp) {
-      return res.status(202).json({
-        requiresOtp: true,
-        email: emailLower,
-        message: 'A 6-digit OTP verification code has been sent to confirm ownership of your resident profile.',
-      });
-    }
-
-    if (role === 'OWNER') {
-      await logAudit({
-        user: {
-          id: createdUser.id,
-          organizationId: createdUser.organizationId,
-          name: createdUser.name,
-          email: createdUser.email,
-          phone: createdUser.phone,
-          role: createdUser.role,
-          assignedPropertyIds: [],
-        },
-        action: 'OWNER_REGISTERED',
-        entityType: 'ORGANIZATION',
-        entityId: orgRecord.id,
-        metadata: { organizationName: orgRecord.name },
-      });
-    }
-
-    const token = signSessionToken({
-      userId: createdUser.id,
-      organizationId: createdUser.organizationId,
-      role: createdUser.role,
+    await logAudit({
+      user: serializeSessionUser(createdStudent),
+      action: 'STUDENT_ACCOUNT_REGISTERED',
+      entityType: 'USER',
+      entityId: createdStudent.id,
+      metadata: { email: emailLower },
     });
-    setSessionCookie(req, res, token);
 
-    const cookieOnly = shouldUseCookieOnlyAuth(req);
-    return res.status(201).json({
-      token: cookieOnly ? undefined : token,
-      cookieOnly,
-      user: {
-        id: createdUser.id,
-        organizationId: createdUser.organizationId,
-        name: createdUser.name,
-        email: createdUser.email,
-        phone: createdUser.phone,
-        role: createdUser.role,
-        assignedPropertyIds: createdUser.assignedPropertyIds,
-      },
-      organization: orgRecord,
+    if (process.env.NODE_ENV !== 'production') {
+      console.info(`[PGDesk Email Verification] Student verification code for ${emailLower}: ${verificationCode}`);
+    }
+
+    return res.status(202).json({
+      requiresEmailVerification: true,
+      email: emailLower,
+      message: 'Account created. Enter the 6-digit verification code sent to your email address.',
     });
   } catch (err) {
     console.error('POST /api/auth/register error:', err);
@@ -272,16 +311,16 @@ authRouter.post('/register', async (req, res) => {
   }
 });
 
-authRouter.post('/verify-otp', async (req, res) => {
+authRouter.post('/verify-email', async (req, res) => {
   try {
     const ip = req.ip || 'unknown';
-    if (!checkRateLimit(`verify-otp:${ip}`, 15, 10 * 60 * 1000)) {
-      return res.status(429).json({ error: 'Too many OTP attempts. Please wait a few minutes.' });
+    if (!checkRateLimit(`verify-email:${ip}`, 20, 10 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many verification attempts. Please wait a few minutes.' });
     }
 
-    const parsed = verifyOtpSchema.safeParse(req.body);
+    const parsed = verifyEmailSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid OTP request' });
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid verification code' });
     }
 
     const emailLower = parsed.data.email.trim().toLowerCase();
@@ -291,49 +330,31 @@ authRouter.post('/verify-otp', async (req, res) => {
       .where(eq(schema.users.email, emailLower))
       .limit(1);
 
-    if (!user || !user.otpCodeHash || !user.otpExpiresAt) {
-      return res.status(400).json({ error: 'Invalid or expired verification code' });
+    if (!user || !user.isActive || !user.emailVerificationTokenHash || !user.emailVerificationExpiresAt) {
+      return res.status(400).json({ error: 'Invalid or expired email verification code' });
     }
-    if (user.otpExpiresAt.getTime() < Date.now() || !verifyTokenHash(parsed.data.otp, user.otpCodeHash)) {
-      return res.status(400).json({ error: 'Invalid or expired 6-digit verification code' });
+    if (
+      user.emailVerificationExpiresAt.getTime() < Date.now() ||
+      !verifyTokenHash(parsed.data.code, user.emailVerificationTokenHash)
+    ) {
+      return res.status(400).json({ error: 'Invalid or expired email verification code' });
     }
 
     const [verifiedUser] = await db
       .update(schema.users)
       .set({
         emailVerified: true,
-        otpCodeHash: null,
-        otpExpiresAt: null,
+        emailVerificationTokenHash: null,
+        emailVerificationExpiresAt: null,
+        lastLoginAt: new Date(),
         updatedAt: new Date(),
       })
       .where(eq(schema.users.id, user.id))
       .returning();
 
-    const phone10 = normalizePhone10(verifiedUser.phone || '');
-    await db
-      .update(schema.tenants)
-      .set({ userId: verifiedUser.id, updatedAt: new Date() })
-      .where(
-        and(
-          eq(schema.tenants.organizationId, verifiedUser.organizationId),
-          isNull(schema.tenants.deletedAt),
-          phone10.length === 10
-            ? or(eq(schema.tenants.email, verifiedUser.email), eq(schema.tenants.phone, phone10))
-            : eq(schema.tenants.email, verifiedUser.email)
-        )
-      );
-
     await logAudit({
-      user: {
-        id: verifiedUser.id,
-        organizationId: verifiedUser.organizationId,
-        name: verifiedUser.name,
-        email: verifiedUser.email,
-        phone: verifiedUser.phone,
-        role: verifiedUser.role,
-        assignedPropertyIds: verifiedUser.assignedPropertyIds,
-      },
-      action: 'TENANT_OTP_VERIFIED',
+      user: serializeSessionUser(verifiedUser),
+      action: 'EMAIL_VERIFIED',
       entityType: 'USER',
       entityId: verifiedUser.id,
       metadata: { email: verifiedUser.email },
@@ -345,60 +366,85 @@ authRouter.post('/verify-otp', async (req, res) => {
       .where(eq(schema.organizations.id, verifiedUser.organizationId))
       .limit(1);
 
-    const token = signSessionToken({
-      userId: verifiedUser.id,
-      organizationId: verifiedUser.organizationId,
-      role: verifiedUser.role,
-    });
-    setSessionCookie(req, res, token);
+    const { token, cookieOnly } = await issueUserSession(req, res, verifiedUser);
 
-    const cookieOnly = shouldUseCookieOnlyAuth(req);
     return res.json({
       token: cookieOnly ? undefined : token,
       cookieOnly,
-      user: {
-        id: verifiedUser.id,
-        organizationId: verifiedUser.organizationId,
-        name: verifiedUser.name,
-        email: verifiedUser.email,
-        phone: verifiedUser.phone,
-        role: verifiedUser.role,
-        assignedPropertyIds: verifiedUser.assignedPropertyIds,
-      },
-      organization: org || null,
+      user: serializeSessionUser(verifiedUser),
+      organization: verifiedUser.role === 'ADMIN' ? null : org || null,
     });
   } catch (err) {
-    console.error('POST /api/auth/verify-otp error:', err);
-    return res.status(500).json({ error: 'OTP verification failed' });
+    console.error('POST /api/auth/verify-email error:', err);
+    return res.status(500).json({ error: 'Email verification failed' });
+  }
+});
+
+authRouter.post('/resend-verification', async (req, res) => {
+  try {
+    const ip = req.ip || 'unknown';
+    if (!checkRateLimit(`resend-verify:${ip}`, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many verification requests. Please wait a few minutes.' });
+    }
+
+    const parsed = resendVerificationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Enter a valid email address' });
+    }
+
+    const emailLower = parsed.data.email.trim().toLowerCase();
+    const [user] = await db
+      .select()
+      .from(schema.users)
+      .where(eq(schema.users.email, emailLower))
+      .limit(1);
+
+    if (user && user.isActive && !user.emailVerified) {
+      const code = generateSixDigitOtp();
+      await db
+        .update(schema.users)
+        .set({
+          emailVerificationTokenHash: hashToken(code),
+          emailVerificationExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.users.id, user.id));
+
+      if (process.env.NODE_ENV !== 'production') {
+        console.info(`[PGDesk Email Verification] Resent code for ${emailLower}: ${code}`);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      message: 'If your account is awaiting verification, a new 6-digit code has been sent to your email.',
+    });
+  } catch (err) {
+    console.error('POST /api/auth/resend-verification error:', err);
+    return res.status(500).json({ error: 'Failed to resend verification email' });
   }
 });
 
 authRouter.post('/forgot-password', async (req, res) => {
   try {
     await ensureSeeded();
+    await ensureAdminBootstrapped();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`forgot-pwd:${ip}`, 10, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many reset requests. Please try again later.' });
     }
 
+    // Strict email-only recovery (no mobile number or SMS OTP)
     const parsed = forgotPasswordSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid identifier' });
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Enter a valid email address' });
     }
 
-    const identifier = parsed.data.identifier.trim().toLowerCase();
-    const digitsOnly = identifier.replace(/\D/g, '');
-    const normalizedPhone =
-      digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
-
+    const emailLower = parsed.data.email.trim().toLowerCase();
     const found = await db
       .select()
       .from(schema.users)
-      .where(
-        normalizedPhone.length === 10
-          ? or(eq(schema.users.email, identifier), eq(schema.users.phone, normalizedPhone))
-          : eq(schema.users.email, identifier)
-      )
+      .where(eq(schema.users.email, emailLower))
       .limit(1);
 
     const user = found[0];
@@ -412,11 +458,15 @@ authRouter.post('/forgot-password', async (req, res) => {
           updatedAt: new Date(),
         })
         .where(eq(schema.users.id, user.id));
+
+      if (process.env.NODE_ENV !== 'production') {
+        console.info(`[PGDesk Auth] Email password reset code issued for user #${user.id}: ${code}`);
+      }
     }
 
     return res.json({
       ok: true,
-      message: 'If an account matches that email or mobile number, a 6-digit reset code has been sent.',
+      message: 'If an account matches that email address, a 6-digit password reset code has been sent via email.',
     });
   } catch (err) {
     console.error('POST /api/auth/forgot-password error:', err);
@@ -436,19 +486,11 @@ authRouter.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid reset request' });
     }
 
-    const identifier = parsed.data.identifier.trim().toLowerCase();
-    const digitsOnly = identifier.replace(/\D/g, '');
-    const normalizedPhone =
-      digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
-
+    const emailLower = parsed.data.email.trim().toLowerCase();
     const found = await db
       .select()
       .from(schema.users)
-      .where(
-        normalizedPhone.length === 10
-          ? or(eq(schema.users.email, identifier), eq(schema.users.phone, normalizedPhone))
-          : eq(schema.users.email, identifier)
-      )
+      .where(eq(schema.users.email, emailLower))
       .limit(1);
 
     const user = found[0];
@@ -460,9 +502,10 @@ authRouter.post('/reset-password', async (req, res) => {
       user.resetTokenExpiresAt.getTime() < Date.now() ||
       !verifyTokenHash(parsed.data.code, user.resetTokenHash)
     ) {
-      return res.status(400).json({ error: 'Invalid or expired reset code' });
+      return res.status(400).json({ error: 'Invalid or expired email reset code' });
     }
 
+    const nextVersion = (user.tokenVersion ?? 1) + 1;
     await db
       .update(schema.users)
       .set({
@@ -470,24 +513,22 @@ authRouter.post('/reset-password', async (req, res) => {
         resetTokenHash: null,
         resetTokenExpiresAt: null,
         emailVerified: true,
+        tokenVersion: nextVersion,
         updatedAt: new Date(),
       })
       .where(eq(schema.users.id, user.id));
 
+    await db
+      .update(schema.userSessions)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(schema.userSessions.userId, user.id), isNull(schema.userSessions.revokedAt)));
+
     await logAudit({
-      user: {
-        id: user.id,
-        organizationId: user.organizationId,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        assignedPropertyIds: user.assignedPropertyIds,
-      },
+      user: serializeSessionUser(user),
       action: 'PASSWORD_RESET',
       entityType: 'USER',
       entityId: user.id,
-      metadata: { email: user.email },
+      metadata: { email: user.email, channel: 'EMAIL' },
     });
 
     return res.json({
@@ -503,6 +544,7 @@ authRouter.post('/reset-password', async (req, res) => {
 authRouter.post('/login', async (req, res) => {
   try {
     await ensureSeeded();
+    await ensureAdminBootstrapped();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`login:${ip}`, 25, 10 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many login attempts. Please wait a few minutes.' });
@@ -533,41 +575,47 @@ authRouter.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email/mobile number or password' });
     }
 
-    if (user.role === 'TENANT' && user.emailVerified === false) {
+    if (user.role !== 'ADMIN' && user.emailVerified === false) {
       return res.status(403).json({
-        error: 'Please verify the 6-digit OTP code before accessing your resident portal.',
-        requiresOtp: true,
+        error: 'Please verify your email address before signing in.',
+        requiresEmailVerification: true,
         email: user.email,
       });
     }
 
-    const [org] = await db
-      .select()
-      .from(schema.organizations)
-      .where(eq(schema.organizations.id, user.organizationId))
-      .limit(1);
+    await db
+      .update(schema.users)
+      .set({ lastLoginAt: new Date(), updatedAt: new Date() })
+      .where(eq(schema.users.id, user.id));
 
-    const token = signSessionToken({
-      userId: user.id,
-      organizationId: user.organizationId,
-      role: user.role,
-    });
-    setSessionCookie(req, res, token);
+    if (user.role === 'ADMIN') {
+      await logAudit({
+        user: serializeSessionUser(user),
+        action: 'ADMIN_LOGIN',
+        entityType: 'USER',
+        entityId: user.id,
+        metadata: { email: user.email },
+      });
+    }
 
-    const cookieOnly = shouldUseCookieOnlyAuth(req);
+    const org =
+      user.role === 'ADMIN'
+        ? null
+        : (
+            await db
+              .select()
+              .from(schema.organizations)
+              .where(eq(schema.organizations.id, user.organizationId))
+              .limit(1)
+          )[0] || null;
+
+    const { token, cookieOnly } = await issueUserSession(req, res, user);
+
     return res.json({
       token: cookieOnly ? undefined : token,
       cookieOnly,
-      user: {
-        id: user.id,
-        organizationId: user.organizationId,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        assignedPropertyIds: user.assignedPropertyIds,
-      },
-      organization: org || null,
+      user: serializeSessionUser(user),
+      organization: org,
     });
   } catch (err) {
     console.error('POST /api/auth/login error:', err);
@@ -600,32 +648,23 @@ authRouter.post('/demo', async (req, res) => {
       return res.status(404).json({ error: 'Demo account not found' });
     }
 
+    await db
+      .update(schema.users)
+      .set({ lastLoginAt: new Date(), updatedAt: new Date() })
+      .where(eq(schema.users.id, user.id));
+
     const [org] = await db
       .select()
       .from(schema.organizations)
       .where(eq(schema.organizations.id, user.organizationId))
       .limit(1);
 
-    const token = signSessionToken({
-      userId: user.id,
-      organizationId: user.organizationId,
-      role: user.role,
-    });
-    setSessionCookie(req, res, token);
+    const { token, cookieOnly } = await issueUserSession(req, res, user);
 
-    const cookieOnly = shouldUseCookieOnlyAuth(req);
     return res.json({
       token: cookieOnly ? undefined : token,
       cookieOnly,
-      user: {
-        id: user.id,
-        organizationId: user.organizationId,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        assignedPropertyIds: user.assignedPropertyIds,
-      },
+      user: serializeSessionUser(user),
       organization: org || null,
     });
   } catch (err) {
@@ -634,7 +673,24 @@ authRouter.post('/demo', async (req, res) => {
   }
 });
 
-authRouter.post('/logout', (req, res) => {
+authRouter.post('/logout', async (req: Request, res: Response) => {
+  try {
+    const resolved = await resolveAuthUser(req);
+    if (resolved?.sessionId) {
+      await db
+        .update(schema.userSessions)
+        .set({ revokedAt: new Date() })
+        .where(
+          and(
+            eq(schema.userSessions.userId, resolved.user.id),
+            eq(schema.userSessions.sessionId, resolved.sessionId)
+          )
+        );
+    }
+  } catch {
+    // Best-effort session revocation on logout
+  }
+
   const opts = getCookieOptions(req);
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: opts.httpOnly,

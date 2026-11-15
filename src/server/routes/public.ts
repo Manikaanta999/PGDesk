@@ -3,6 +3,7 @@ import { and, eq, isNull, ne } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import { ensureSeeded } from '../../db/seed.ts';
 import { checkRateLimit, isDemoModeEnabled } from '../../lib/security.ts';
+import { PLATFORM_ORG_SLUG } from '../../lib/platformAuth.ts';
 import { publicEnquirySchema } from '../../lib/validation.ts';
 
 export const publicRouter = Router();
@@ -20,10 +21,15 @@ publicRouter.get('/properties', async (_req, res) => {
       .innerJoin(schema.organizations, eq(schema.properties.organizationId, schema.organizations.id))
       .where(
         demoEnabled
-          ? and(eq(schema.properties.isPublic, true), isNull(schema.properties.deletedAt))
+          ? and(
+              eq(schema.properties.isPublic, true),
+              isNull(schema.properties.deletedAt),
+              ne(schema.organizations.slug, PLATFORM_ORG_SLUG)
+            )
           : and(
               eq(schema.properties.isPublic, true),
               isNull(schema.properties.deletedAt),
+              ne(schema.organizations.slug, PLATFORM_ORG_SLUG),
               ne(schema.organizations.slug, 'sharma-residency')
             )
       );
@@ -183,8 +189,13 @@ publicRouter.post('/enquiries', async (req, res) => {
       return res.status(404).json({ error: 'Selected property was not found' });
     }
 
-    const digits = parsed.data.phone.replace(/\D/g, '');
-    const normalizedPhone = digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
+    const digits = (parsed.data.phone || '').replace(/\D/g, '');
+    const normalizedPhone =
+      digits.length === 12 && digits.startsWith('91')
+        ? digits.slice(2)
+        : digits.length >= 10
+          ? digits.slice(-10)
+          : '';
 
     const [enquiry] = await db
       .insert(schema.enquiries)
@@ -192,12 +203,12 @@ publicRouter.post('/enquiries', async (req, res) => {
         organizationId: prop.organizationId,
         propertyId: prop.id,
         name: parsed.data.name,
-        phone: normalizedPhone,
-        email: parsed.data.email || null,
+        phone: normalizedPhone || null,
+        email: parsed.data.email ? parsed.data.email.trim().toLowerCase() : null,
         preferredRoomType: parsed.data.preferredRoomType,
         moveInDate: parsed.data.moveInDate || null,
         message: parsed.data.message,
-        status: 'NEW',
+        status: 'NEW_ENQUIRY',
         source: 'PUBLIC_LISTING',
       })
       .returning();

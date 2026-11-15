@@ -12,7 +12,10 @@ import {
   getIndianFinancialYearLabel,
   validateMaskedIdNumber,
 } from './billing.ts';
+import { getActiveEntitlement, isFeatureAvailable, SUBSCRIPTIONS_ENABLED } from './entitlements.ts';
 import { hashToken, isDemoModeEnabled, verifyCronSecret, verifyTokenHash } from './security.ts';
+import { createTenantSchema, updateTenantProfileSchema } from './validation.ts';
+import { parseDemoVideoSource } from './videoConfig.ts';
 
 test('full month rent when joined in a previous month', () => {
   const res = calculateProRataRent({
@@ -160,12 +163,58 @@ test('calculateGstBreakdown splits CGST and SGST accurately', () => {
   assert.equal(gst12.totalWithGst, 11200);
 });
 
-test('SaaS plan tier enforces property and bed limits', () => {
-  assert.equal(checkPlanPropertyLimit({ planTier: 'STARTER', currentProperties: 1 }).allowed, false);
-  assert.equal(checkPlanPropertyLimit({ planTier: 'GROWTH', currentProperties: 1 }).allowed, true);
-  assert.equal(checkPlanBedLimit({ planTier: 'STARTER', currentBeds: 34, bedsToAdd: 2 }).allowed, false);
-  assert.equal(checkPlanBedLimit({ planTier: 'STARTER', currentBeds: 32, bedsToAdd: 3 }).allowed, true);
-  assert.equal(checkPlanBedLimit({ planTier: 'ENTERPRISE', currentBeds: 500, bedsToAdd: 10 }).allowed, true);
+test('free-access model unlocks basic property and bed operations when subscriptions are disabled', () => {
+  assert.equal(SUBSCRIPTIONS_ENABLED, false);
+  assert.equal(checkPlanPropertyLimit({ planTier: 'STARTER', currentProperties: 5 }).allowed, true);
+  assert.equal(checkPlanBedLimit({ planTier: 'STARTER', currentBeds: 200, bedsToAdd: 20 }).allowed, true);
+  assert.equal(isFeatureAvailable('hostels', 'STARTER'), true);
+  assert.equal(getActiveEntitlement('STARTER').label, 'Free Access');
+
+  // Future tier limits remain cleanly testable when subscriptions are enabled
+  assert.equal(
+    checkPlanPropertyLimit({ planTier: 'STARTER', currentProperties: 1, enforceSubscriptionLimits: true }).allowed,
+    false
+  );
+  assert.equal(
+    checkPlanPropertyLimit({ planTier: 'GROWTH', currentProperties: 1, enforceSubscriptionLimits: true }).allowed,
+    true
+  );
+  assert.equal(
+    checkPlanBedLimit({ planTier: 'STARTER', currentBeds: 34, bedsToAdd: 2, enforceSubscriptionLimits: true }).allowed,
+    false
+  );
+  assert.equal(
+    checkPlanBedLimit({ planTier: 'STARTER', currentBeds: 32, bedsToAdd: 3, enforceSubscriptionLimits: true }).allowed,
+    true
+  );
+  assert.equal(
+    checkPlanBedLimit({ planTier: 'ENTERPRISE', currentBeds: 500, bedsToAdd: 10, enforceSubscriptionLimits: true }).allowed,
+    true
+  );
+});
+
+test('parseDemoVideoSource parses placeholder, MP4, YouTube, and Vimeo URLs', () => {
+  assert.deepEqual(parseDemoVideoSource(''), { type: 'placeholder' });
+  assert.deepEqual(parseDemoVideoSource('https://cdn.example.com/demo.mp4'), {
+    type: 'mp4',
+    src: 'https://cdn.example.com/demo.mp4',
+  });
+  assert.deepEqual(parseDemoVideoSource('/videos/pgdesk.mp4'), {
+    type: 'mp4',
+    src: '/videos/pgdesk.mp4',
+  });
+  assert.deepEqual(parseDemoVideoSource('https://www.youtube.com/watch?v=dQw4w9WgXcQ'), {
+    type: 'embed',
+    src: 'https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?rel=0',
+  });
+  assert.deepEqual(parseDemoVideoSource('https://youtu.be/abc123XYZ'), {
+    type: 'embed',
+    src: 'https://www.youtube-nocookie.com/embed/abc123XYZ?rel=0',
+  });
+  assert.deepEqual(parseDemoVideoSource('https://vimeo.com/123456789'), {
+    type: 'embed',
+    src: 'https://player.vimeo.com/video/123456789',
+  });
 });
 
 test('validateMaskedIdNumber rejects full 12-digit Aadhaar and accepts masked format', () => {
@@ -188,5 +237,58 @@ test('security helpers: demo mode gating, OTP token hash, and cron secret check'
   assert.equal(verifyCronSecret('Bearer super-secret-cron-key', 'super-secret-cron-key'), true);
   assert.equal(verifyCronSecret('Bearer wrong-key', 'super-secret-cron-key'), false);
   assert.equal(verifyCronSecret(undefined, 'super-secret-cron-key'), false);
+});
+
+test('createTenantSchema allows optional emergency contact & KYC and defaults generateJoiningInvoice to false', () => {
+  const minimal = createTenantSchema.safeParse({
+    name: 'Kiran Rao',
+    phone: '9876501234',
+    propertyId: 1,
+    bedId: 2,
+    joinDate: '2026-11-14',
+    monthlyRent: 6000,
+    securityDeposit: 12000,
+  });
+  assert.equal(minimal.success, true);
+  if (minimal.success) {
+    assert.equal(minimal.data.generateJoiningInvoice, false);
+    assert.equal(minimal.data.emergencyContactName, '');
+    assert.equal(minimal.data.emergencyContactPhone, '');
+    assert.equal(minimal.data.idNumberMasked, '');
+  }
+
+  const badAadhaar = createTenantSchema.safeParse({
+    name: 'Kiran Rao',
+    phone: '9876501234',
+    propertyId: 1,
+    bedId: 2,
+    idType: 'Aadhaar',
+    idNumberMasked: '123456789012',
+    joinDate: '2026-11-14',
+    monthlyRent: 6000,
+    securityDeposit: 12000,
+  });
+  assert.equal(badAadhaar.success, false);
+});
+
+test('updateTenantProfileSchema validates profile updates and masked Aadhaar when provided', () => {
+  const okProfile = updateTenantProfileSchema.safeParse({
+    name: 'Kiran Rao',
+    phone: '9876501234',
+    occupation: 'Software Engineer',
+    companyOrCollege: 'Razorpay',
+    permanentAddress: '12 MG Road, Mysuru',
+    emergencyContactName: 'Suresh Rao',
+    emergencyContactPhone: '9845001122',
+    idType: 'Aadhaar',
+    idNumberMasked: 'XXXX-XXXX-4512',
+  });
+  assert.equal(okProfile.success, true);
+
+  const badPhone = updateTenantProfileSchema.safeParse({
+    name: 'Kiran Rao',
+    emergencyContactPhone: '123',
+  });
+  assert.equal(badPhone.success, false);
 });
 

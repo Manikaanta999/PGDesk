@@ -50,7 +50,8 @@ export function formatMonthYear(month: number, year: number): string {
   return `${MONTHS_SHORT[idx]} ${year}`;
 }
 
-export function formatIndianPhone(phone: string): string {
+export function formatIndianPhone(phone: string | null | undefined): string {
+  if (!phone || !phone.trim()) return 'Not provided';
   const digits = phone.replace(/\D/g, '');
   if (digits.length === 10) {
     return `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`;
@@ -62,7 +63,7 @@ export function formatIndianPhone(phone: string): string {
 }
 
 export function buildWhatsAppReminderUrl(params: {
-  phone: string;
+  phone: string | null | undefined;
   tenantName: string;
   propertyName: string;
   invoiceNumber: string;
@@ -71,7 +72,8 @@ export function buildWhatsAppReminderUrl(params: {
   dueDate: string;
   upiId?: string;
 }): string {
-  const digits = params.phone.replace(/\D/g, '');
+  const digits = String(params.phone || '').replace(/\D/g, '');
+  if (!digits) return '';
   const normalized = digits.length === 10 ? `91${digits}` : digits;
   const upiLine = params.upiId ? `\nUPI ID: ${params.upiId}` : '';
   const text =

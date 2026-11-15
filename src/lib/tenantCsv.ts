@@ -4,7 +4,7 @@ import { formatDateDDMMYYYY, formatIndianPhone } from './format.ts';
 export interface TenantCsvRow {
   id: number;
   name: string;
-  phone: string;
+  phone: string | null;
   email: string | null;
   propertyName: string;
   bedLabel: string;
@@ -62,7 +62,7 @@ export function buildTenantsCsv(tenants: TenantCsvRow[]): string {
 
     return {
       'Resident Name': sanitizeCsvValue(t.name),
-      Phone: sanitizeCsvValue(formatIndianPhone(t.phone)),
+      Phone: sanitizeCsvValue(t.phone ? formatIndianPhone(t.phone) : ''),
       Email: sanitizeCsvValue(t.email || ''),
       'Occupation / Organization': sanitizeCsvValue(occupationText),
       Property: sanitizeCsvValue(t.propertyName),

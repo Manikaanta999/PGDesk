@@ -22,7 +22,9 @@ export function verifyPassword(password: string, storedHash: string | null | und
 export interface SessionPayload {
   userId: number;
   organizationId: number;
-  role: 'OWNER' | 'MANAGER' | 'TENANT';
+  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+  tv?: number;
+  sid?: string;
   exp: number;
 }
 

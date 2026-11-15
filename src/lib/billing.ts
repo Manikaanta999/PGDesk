@@ -1,3 +1,10 @@
+import {
+  FUTURE_PLAN_ENTITLEMENTS,
+  getActiveEntitlement,
+  PlanTier as EntitlementPlanTier,
+  SUBSCRIPTIONS_ENABLED,
+} from './entitlements.ts';
+
 export interface ProRataCalculationInput {
   monthlyRent: number;
   year: number;
@@ -232,24 +239,25 @@ export function calculateGstBreakdown(baseAmount: number, gstRatePct: number): G
   };
 }
 
-export type PlanTier = 'STARTER' | 'GROWTH' | 'ENTERPRISE';
+export type PlanTier = Exclude<EntitlementPlanTier, 'FREE'>;
 
 export const PLAN_LIMITS: Record<
   PlanTier,
   { label: string; maxProperties: number | null; maxBeds: number | null; priceInr: number }
 > = {
-  STARTER: { label: 'Starter PG', maxProperties: 1, maxBeds: 35, priceInr: 999 },
-  GROWTH: { label: 'Growth Operator', maxProperties: 5, maxBeds: 200, priceInr: 2499 },
-  ENTERPRISE: { label: 'Enterprise Co-Living', maxProperties: null, maxBeds: null, priceInr: 5999 },
+  STARTER: FUTURE_PLAN_ENTITLEMENTS.STARTER,
+  GROWTH: FUTURE_PLAN_ENTITLEMENTS.GROWTH,
+  ENTERPRISE: FUTURE_PLAN_ENTITLEMENTS.ENTERPRISE,
 };
 
 export function checkPlanBedLimit(params: {
   planTier: string | null | undefined;
   currentBeds: number;
   bedsToAdd: number;
+  enforceSubscriptionLimits?: boolean;
 }): { allowed: boolean; maxBeds: number | null; planLabel: string; message?: string } {
-  const tier = (params.planTier?.toUpperCase() as PlanTier) || 'STARTER';
-  const limits = PLAN_LIMITS[tier] || PLAN_LIMITS.STARTER;
+  const enforce = params.enforceSubscriptionLimits ?? SUBSCRIPTIONS_ENABLED;
+  const limits = getActiveEntitlement(params.planTier, enforce);
   if (limits.maxBeds === null) {
     return { allowed: true, maxBeds: null, planLabel: limits.label };
   }
@@ -258,7 +266,7 @@ export function checkPlanBedLimit(params: {
       allowed: false,
       maxBeds: limits.maxBeds,
       planLabel: limits.label,
-      message: `${limits.label} plan allows up to ${limits.maxBeds} beds (currently ${params.currentBeds}). Upgrade in Settings to add ${params.bedsToAdd} more bed(s).`,
+      message: `${limits.label} plan allows up to ${limits.maxBeds} beds (currently ${params.currentBeds}).`,
     };
   }
   return { allowed: true, maxBeds: limits.maxBeds, planLabel: limits.label };
@@ -267,9 +275,10 @@ export function checkPlanBedLimit(params: {
 export function checkPlanPropertyLimit(params: {
   planTier: string | null | undefined;
   currentProperties: number;
+  enforceSubscriptionLimits?: boolean;
 }): { allowed: boolean; maxProperties: number | null; planLabel: string; message?: string } {
-  const tier = (params.planTier?.toUpperCase() as PlanTier) || 'STARTER';
-  const limits = PLAN_LIMITS[tier] || PLAN_LIMITS.STARTER;
+  const enforce = params.enforceSubscriptionLimits ?? SUBSCRIPTIONS_ENABLED;
+  const limits = getActiveEntitlement(params.planTier, enforce);
   if (limits.maxProperties === null) {
     return { allowed: true, maxProperties: null, planLabel: limits.label };
   }
@@ -278,7 +287,7 @@ export function checkPlanPropertyLimit(params: {
       allowed: false,
       maxProperties: limits.maxProperties,
       planLabel: limits.label,
-      message: `${limits.label} plan allows up to ${limits.maxProperties} property(ies). Upgrade in Settings to add another property.`,
+      message: `${limits.label} plan allows up to ${limits.maxProperties} property(ies).`,
     };
   }
   return { allowed: true, maxProperties: limits.maxProperties, planLabel: limits.label };

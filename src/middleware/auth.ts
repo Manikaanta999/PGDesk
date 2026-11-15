@@ -1,8 +1,9 @@
+import crypto from 'node:crypto';
 import { NextFunction, Request, Response } from 'express';
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
-import { verifySessionToken } from '../lib/security.ts';
+import { signSessionToken, verifySessionToken } from '../lib/security.ts';
 
 export interface AuthUser {
   id: number;
@@ -10,17 +11,105 @@ export interface AuthUser {
   name: string;
   email: string;
   phone: string | null;
-  role: 'OWNER' | 'MANAGER' | 'TENANT';
+  photoUrl?: string | null;
+  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
   assignedPropertyIds: number[];
+  tokenVersion?: number;
 }
 
 export interface AuthRequest extends Request {
   user?: AuthUser;
+  sessionId?: string;
+  authMethod?: 'SESSION' | 'GOOGLE';
 }
 
 export const SESSION_COOKIE_NAME = 'pgdesk_session';
 
-async function loadUserById(userId: number): Promise<AuthUser | null> {
+export function isCrossOriginIframeRequest(req: Request): boolean {
+  const secFetchDest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
+  if (secFetchDest === 'iframe') return true;
+  const reqHost = req.get('host') || '';
+  const originHeader = req.headers.origin;
+  if (originHeader && reqHost) {
+    try {
+      const originHost = new URL(originHeader).host;
+      if (originHost && originHost !== reqHost) return true;
+    } catch {
+      // Ignore malformed Origin header
+    }
+  }
+  return false;
+}
+
+export function getCookieOptions(req: Request) {
+  const isHttps =
+    req.secure ||
+    req.headers['x-forwarded-proto'] === 'https' ||
+    process.env.NODE_ENV === 'production';
+  const isIframe = isCrossOriginIframeRequest(req);
+  const sameSite: 'none' | 'lax' =
+    process.env.NODE_ENV === 'production' && !isIframe
+      ? 'lax'
+      : isHttps && isIframe
+        ? 'none'
+        : isHttps
+          ? 'none'
+          : 'lax';
+
+  return {
+    httpOnly: true,
+    sameSite,
+    secure: Boolean(isHttps),
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  };
+}
+
+export function shouldUseCookieOnlyAuth(req: Request): boolean {
+  return process.env.NODE_ENV === 'production' && !isCrossOriginIframeRequest(req);
+}
+
+export function setSessionCookie(req: Request, res: Response, token: string) {
+  res.cookie(SESSION_COOKIE_NAME, token, getCookieOptions(req));
+}
+
+export async function issueUserSession(
+  req: Request,
+  res: Response,
+  user: { id: number; organizationId: number; role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT'; tokenVersion?: number },
+  existingSessionId?: string
+): Promise<{ token: string; cookieOnly: boolean; sessionId: string }> {
+  const sessionId = existingSessionId || crypto.randomUUID();
+  const ua = String(req.headers['user-agent'] || 'Web Browser').slice(0, 220);
+  const ip = String(req.ip || '').slice(0, 80);
+
+  if (!existingSessionId) {
+    await db.insert(schema.userSessions).values({
+      userId: user.id,
+      sessionId,
+      userAgent: ua,
+      ipAddress: ip,
+    });
+  } else {
+    await db
+      .update(schema.userSessions)
+      .set({ lastSeenAt: new Date(), revokedAt: null })
+      .where(and(eq(schema.userSessions.userId, user.id), eq(schema.userSessions.sessionId, sessionId)));
+  }
+
+  const token = signSessionToken({
+    userId: user.id,
+    organizationId: user.organizationId,
+    role: user.role,
+    tv: user.tokenVersion ?? 1,
+    sid: sessionId,
+  });
+  setSessionCookie(req, res, token);
+  const cookieOnly = shouldUseCookieOnlyAuth(req);
+  return { token, cookieOnly, sessionId };
+}
+
+async function loadUserById(userId: number, expectedTokenVersion?: number): Promise<AuthUser | null> {
   const rows = await db
     .select()
     .from(schema.users)
@@ -28,19 +117,46 @@ async function loadUserById(userId: number): Promise<AuthUser | null> {
     .limit(1);
   const u = rows[0];
   if (!u || !u.isActive) return null;
-  if (u.role === 'TENANT' && u.emailVerified === false) return null;
+  if (u.role !== 'ADMIN' && u.emailVerified === false) return null;
+  if (expectedTokenVersion !== undefined && expectedTokenVersion !== (u.tokenVersion ?? 1)) {
+    return null;
+  }
   return {
     id: u.id,
     organizationId: u.organizationId,
     name: u.name,
     email: u.email,
     phone: u.phone,
+    photoUrl: u.photoUrl,
     role: u.role,
     assignedPropertyIds: Array.isArray(u.assignedPropertyIds) ? u.assignedPropertyIds : [],
+    tokenVersion: u.tokenVersion ?? 1,
   };
 }
 
-export async function resolveAuthUser(req: Request): Promise<AuthUser | null> {
+async function isSessionRecordActive(userId: number, sessionId?: string): Promise<boolean> {
+  if (!sessionId) return true;
+  const rows = await db
+    .select({ id: schema.userSessions.id, revokedAt: schema.userSessions.revokedAt, lastSeenAt: schema.userSessions.lastSeenAt })
+    .from(schema.userSessions)
+    .where(and(eq(schema.userSessions.userId, userId), eq(schema.userSessions.sessionId, sessionId)))
+    .limit(1);
+
+  if (!rows[0] || rows[0].revokedAt) return false;
+
+  // Throttle lastSeenAt updates to every 5 minutes
+  if (Date.now() - rows[0].lastSeenAt.getTime() > 5 * 60 * 1000) {
+    db.update(schema.userSessions)
+      .set({ lastSeenAt: new Date() })
+      .where(and(eq(schema.userSessions.id, rows[0].id), isNull(schema.userSessions.revokedAt)))
+      .catch(() => {});
+  }
+  return true;
+}
+
+export async function resolveAuthUser(
+  req: Request
+): Promise<{ user: AuthUser; sessionId?: string; authMethod: 'SESSION' | 'GOOGLE' } | null> {
   // 1. Check Authorization: Bearer <token> (works across iframes & blocked 3P cookies)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -48,8 +164,10 @@ export async function resolveAuthUser(req: Request): Promise<AuthUser | null> {
     if (bearerToken) {
       const hmacSession = verifySessionToken(bearerToken);
       if (hmacSession) {
-        const user = await loadUserById(hmacSession.userId);
-        if (user) return user;
+        const user = await loadUserById(hmacSession.userId, hmacSession.tv);
+        if (user && (await isSessionRecordActive(user.id, hmacSession.sid))) {
+          return { user, sessionId: hmacSession.sid, authMethod: 'SESSION' };
+        }
       }
     }
   }
@@ -58,8 +176,10 @@ export async function resolveAuthUser(req: Request): Promise<AuthUser | null> {
   const cookieToken = req.cookies?.[SESSION_COOKIE_NAME] as string | undefined;
   const session = verifySessionToken(cookieToken);
   if (session) {
-    const user = await loadUserById(session.userId);
-    if (user) return user;
+    const user = await loadUserById(session.userId, session.tv);
+    if (user && (await isSessionRecordActive(user.id, session.sid))) {
+      return { user, sessionId: session.sid, authMethod: 'SESSION' };
+    }
   }
 
   // 3. Check Firebase ID Token via Bearer Authorization header (Google Sign-In)
@@ -77,92 +197,59 @@ export async function resolveAuthUser(req: Request): Promise<AuthUser | null> {
 
       if (existing[0]) {
         const u = existing[0];
+        if (!u.isActive) return null;
         return {
-          id: u.id,
-          organizationId: u.organizationId,
-          name: u.name,
-          email: u.email,
-          phone: u.phone,
-          role: u.role,
-          assignedPropertyIds: Array.isArray(u.assignedPropertyIds) ? u.assignedPropertyIds : [],
+          authMethod: 'GOOGLE',
+          user: {
+            id: u.id,
+            organizationId: u.organizationId,
+            name: u.name,
+            email: u.email,
+            phone: u.phone,
+            photoUrl: u.photoUrl,
+            role: u.role,
+            assignedPropertyIds: Array.isArray(u.assignedPropertyIds) ? u.assignedPropertyIds : [],
+            tokenVersion: u.tokenVersion ?? 1,
+          },
         };
       }
 
-      // Check by email or link to seeded organization as OWNER for Google Sign-In workspace onboarding
-      const byEmail = await db
-        .select()
-        .from(schema.users)
-        .where(eq(schema.users.email, email))
-        .limit(1);
+      const byEmail =
+        decoded.email_verified === true
+          ? await db
+              .select()
+              .from(schema.users)
+              .where(eq(schema.users.email, email))
+              .limit(1)
+          : [];
 
       if (byEmail[0]) {
+        if (!byEmail[0].isActive) return null;
         const [updated] = await db
           .update(schema.users)
-          .set({ uid: decoded.uid, updatedAt: new Date() })
+          .set({ uid: decoded.uid, emailVerified: true, updatedAt: new Date() })
           .where(eq(schema.users.id, byEmail[0].id))
           .returning();
         return {
-          id: updated.id,
-          organizationId: updated.organizationId,
-          name: updated.name,
-          email: updated.email,
-          phone: updated.phone,
-          role: updated.role,
-          assignedPropertyIds: Array.isArray(updated.assignedPropertyIds)
-            ? updated.assignedPropertyIds
-            : [],
+          authMethod: 'GOOGLE',
+          user: {
+            id: updated.id,
+            organizationId: updated.organizationId,
+            name: updated.name,
+            email: updated.email,
+            phone: updated.phone,
+            photoUrl: updated.photoUrl,
+            role: updated.role,
+            assignedPropertyIds: Array.isArray(updated.assignedPropertyIds)
+              ? updated.assignedPropertyIds
+              : [],
+            tokenVersion: updated.tokenVersion ?? 1,
+          },
         };
       }
 
-      // Create a fresh Starter workspace for new Google Sign-In owners
-      const displayName = decoded.name || email.split('@')[0];
-      const orgName = `${displayName}'s Residences`;
-      const baseSlug = orgName
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '') || 'pg-workspace';
-      const [createdOrg] = await db
-        .insert(schema.organizations)
-        .values({
-          name: orgName,
-          slug: `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`,
-          upiId: `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`,
-          upiPayeeName: orgName,
-          planTier: 'STARTER',
-          phone: '+91 00000 00000',
-          email,
-          address: 'India',
-        })
-        .returning();
-
-      const [upserted] = await db
-        .insert(schema.users)
-        .values({
-          uid: decoded.uid,
-          organizationId: createdOrg.id,
-          name: displayName,
-          email,
-          role: 'OWNER',
-          assignedPropertyIds: [],
-          isActive: true,
-        })
-        .onConflictDoUpdate({
-          target: schema.users.email,
-          set: { uid: decoded.uid, updatedAt: new Date() },
-        })
-        .returning();
-
-      return {
-        id: upserted.id,
-        organizationId: upserted.organizationId,
-        name: upserted.name,
-        email: upserted.email,
-        phone: upserted.phone,
-        role: upserted.role,
-        assignedPropertyIds: Array.isArray(upserted.assignedPropertyIds)
-          ? upserted.assignedPropertyIds
-          : [],
-      };
+      // Unknown Google users cannot bypass the owner registration token or create unverified workspaces
+      return null;
     } catch (err) {
       console.error('Firebase ID token verification failed:', err);
       return null;
@@ -174,11 +261,13 @@ export async function resolveAuthUser(req: Request): Promise<AuthUser | null> {
 
 export async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
   try {
-    const user = await resolveAuthUser(req);
-    if (!user) {
+    const resolved = await resolveAuthUser(req);
+    if (!resolved) {
       return res.status(401).json({ error: 'Authentication required' });
     }
-    req.user = user;
+    req.user = resolved.user;
+    req.sessionId = resolved.sessionId;
+    req.authMethod = resolved.authMethod;
     next();
   } catch (err) {
     console.error('Auth middleware error:', err);
@@ -186,7 +275,7 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
   }
 }
 
-export function requireRole(...allowedRoles: Array<'OWNER' | 'MANAGER' | 'TENANT'>) {
+export function requireRole(...allowedRoles: Array<'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT'>) {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
@@ -199,12 +288,14 @@ export function requireRole(...allowedRoles: Array<'OWNER' | 'MANAGER' | 'TENANT
 }
 
 export function canAccessProperty(user: AuthUser, propertyId: number): boolean {
+  if (user.role === 'ADMIN') return false;
   if (user.role === 'OWNER') return true;
   if (user.assignedPropertyIds.length === 0) return true;
   return user.assignedPropertyIds.includes(propertyId);
 }
 
 export function getAllowedPropertyIds(user: AuthUser, allPropertyIds: number[]): number[] {
+  if (user.role === 'ADMIN') return [];
   if (user.role === 'OWNER' || user.assignedPropertyIds.length === 0) {
     return allPropertyIds;
   }

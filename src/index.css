@@ -8,6 +8,9 @@
 }
 
 @layer base {
+  .dark {
+    color-scheme: dark;
+  }
   body {
     font-family: var(--font-sans);
   }
@@ -16,6 +19,25 @@
   }
   .tabular-nums {
     font-variant-numeric: tabular-nums;
+  }
+  .dark input:not([type='checkbox']):not([type='radio']):not([type='file']):not([type='range']),
+  .dark select,
+  .dark textarea {
+    background-color: #020617;
+    color: #f1f5f9;
+    border-color: #334155;
+  }
+  .dark input::placeholder,
+  .dark textarea::placeholder {
+    color: #64748b;
+  }
+  .dark input:-webkit-autofill,
+  .dark input:-webkit-autofill:hover,
+  .dark input:-webkit-autofill:focus,
+  .dark select:-webkit-autofill {
+    -webkit-box-shadow: 0 0 0 1000px #020617 inset;
+    -webkit-text-fill-color: #f1f5f9;
+    caret-color: #f1f5f9;
   }
 }
 

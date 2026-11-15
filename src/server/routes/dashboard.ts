@@ -33,6 +33,7 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
           vacantBeds: 0,
           reservedBeds: 0,
           maintenanceBeds: 0,
+          totalStudents: 0,
           collectedThisMonth: 0,
           pendingThisMonth: 0,
           openComplaints: 0,
@@ -41,17 +42,36 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
         },
         revenueSeries: [],
         overdueTenants: [],
+        unpaidInvoices: [],
+        overdueTotalCount: 0,
         upcomingMoveOuts: [],
+        financialSummary: {
+          periodLabel: formatMonthYear(new Date().getMonth() + 1, new Date().getFullYear()),
+          monthlyIncome: 0,
+          monthlyExpenses: 0,
+          netProfit: 0,
+        },
+        needsAttention: {
+          overdueInvoices: [],
+          partialInvoices: [],
+          unresolvedComplaints: [],
+          newEnquiries: [],
+          maintenanceBeds: [],
+        },
         properties: orgProperties,
       });
     }
 
-    const [allBeds, allTenants, allInvoices, allExpenses, allComplaints, allEnquiries, allPayments] =
+    const [allBeds, allRooms, allTenants, allInvoices, allExpenses, allComplaints, allEnquiries, allPayments] =
       await Promise.all([
         db
           .select()
           .from(schema.beds)
           .where(and(eq(schema.beds.organizationId, orgId), inArray(schema.beds.propertyId, activePropertyIds))),
+        db
+          .select()
+          .from(schema.rooms)
+          .where(and(eq(schema.rooms.organizationId, orgId), inArray(schema.rooms.propertyId, activePropertyIds))),
         db
           .select()
           .from(schema.tenants)
@@ -91,6 +111,7 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
     const reservedBeds = allBeds.filter((b) => b.status === 'RESERVED').length;
     const maintenanceBeds = allBeds.filter((b) => b.status === 'MAINTENANCE').length;
     const occupancyPct = totalBeds > 0 ? Math.round((occupiedBeds / totalBeds) * 100) : 0;
+    const totalStudents = allTenants.filter((t) => t.status === 'ACTIVE' || t.status === 'NOTICE').length;
 
     // Determine current period based on latest invoice period or current calendar date
     const now = new Date();
@@ -114,7 +135,7 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
     );
 
     const openComplaints = allComplaints.filter((c) => c.status !== 'RESOLVED').length;
-    const newLeads = allEnquiries.filter((e) => e.status === 'NEW').length;
+    const newLeads = allEnquiries.filter((e) => e.status === 'NEW_ENQUIRY').length;
     const pendingUpiApprovals = allPayments.filter((p) => p.approvalStatus === 'PENDING_APPROVAL').length;
 
     // 6-month revenue & expense series
@@ -143,12 +164,17 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
 
     const tenantMap = new Map(allTenants.map((t) => [t.id, t]));
     const propMap = new Map(orgProperties.map((p) => [p.id, p]));
+    const bedMap = new Map(allBeds.map((b) => [b.id, b]));
+    const roomMap = new Map(allRooms.map((r) => [r.id, r]));
 
-    const overdueTenants = allInvoices
-      .filter((inv) => inv.status === 'OVERDUE' || inv.status === 'PARTIAL')
+    const statusOrder: Record<string, number> = { OVERDUE: 0, PARTIAL: 1, PENDING: 2 };
+    const unpaidInvoices = allInvoices
+      .filter((inv) => inv.status !== 'PAID' && inv.amount - inv.paidAmount > 0)
       .map((inv) => {
         const t = tenantMap.get(inv.tenantId);
         const p = propMap.get(inv.propertyId);
+        const bed = t?.bedId ? bedMap.get(t.bedId) : undefined;
+        const room = bed ? roomMap.get(bed.roomId) : undefined;
         return {
           invoiceId: inv.id,
           invoiceNumber: inv.invoiceNumber,
@@ -156,26 +182,96 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
           tenantName: t?.name || 'Resident',
           tenantPhone: t?.phone || '',
           propertyName: p?.name || '',
+          roomNumber: room?.roomNumber || '',
+          bedLabel: bed?.bedLabel || '',
           dueDate: inv.dueDate,
           balanceDue: Math.max(0, inv.amount - inv.paidAmount),
           status: inv.status,
           periodLabel: formatMonthYear(inv.periodMonth, inv.periodYear),
         };
       })
-      .sort((a, b) => b.balanceDue - a.balanceDue)
-      .slice(0, 8);
+      .sort((a, b) => {
+        const sDiff = (statusOrder[a.status] ?? 3) - (statusOrder[b.status] ?? 3);
+        return sDiff !== 0 ? sDiff : b.balanceDue - a.balanceDue;
+      });
 
     const upcomingMoveOuts = allTenants
       .filter((t) => t.status === 'NOTICE')
-      .map((t) => ({
-        id: t.id,
-        name: t.name,
-        phone: t.phone,
-        propertyName: propMap.get(t.propertyId)?.name || '',
-        leaveDate: t.leaveDate,
-        noticeRequestedAt: t.noticeRequestedAt,
-        securityDeposit: t.securityDeposit,
-      }));
+      .map((t) => {
+        const bed = t.bedId ? bedMap.get(t.bedId) : undefined;
+        const room = bed ? roomMap.get(bed.roomId) : undefined;
+        return {
+          id: t.id,
+          name: t.name,
+          phone: t.phone,
+          propertyName: propMap.get(t.propertyId)?.name || '',
+          roomNumber: room?.roomNumber || '',
+          bedLabel: bed?.bedLabel || '',
+          leaveDate: t.leaveDate,
+          noticeRequestedAt: t.noticeRequestedAt,
+          securityDeposit: t.securityDeposit,
+        };
+      });
+
+    const currentMonthPrefix = `${latestPeriod.year}-${String(latestPeriod.month).padStart(2, '0')}`;
+    const currentMonthExpenseTotal = allExpenses
+      .filter((e) => e.expenseDate.startsWith(currentMonthPrefix))
+      .reduce((s, e) => s + e.amount, 0);
+
+    const priorityRank: Record<string, number> = { URGENT: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+    const unresolvedComplaints = allComplaints
+      .filter((c) => c.status !== 'RESOLVED')
+      .map((c) => {
+        const t = c.tenantId ? tenantMap.get(c.tenantId) : undefined;
+        const p = propMap.get(c.propertyId);
+        const bed = t?.bedId ? bedMap.get(t.bedId) : undefined;
+        const room = bed ? roomMap.get(bed.roomId) : undefined;
+        return {
+          id: c.id,
+          title: c.title,
+          category: c.category,
+          priority: c.priority,
+          status: c.status,
+          tenantName: t?.name || 'Resident',
+          tenantPhone: t?.phone || '',
+          propertyName: p?.name || '',
+          roomNumber: room?.roomNumber || '',
+          bedLabel: bed?.bedLabel || '',
+          createdAt: c.createdAt,
+        };
+      })
+      .sort((a, b) => {
+        const pDiff = (priorityRank[a.priority] ?? 4) - (priorityRank[b.priority] ?? 4);
+        return pDiff !== 0 ? pDiff : new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      });
+
+    const newEnquiries = allEnquiries
+      .filter((e) => e.status === 'NEW_ENQUIRY')
+      .map((e) => ({
+        id: e.id,
+        name: e.name,
+        phone: e.phone,
+        propertyName: propMap.get(e.propertyId)?.name || '',
+        sharingPreference: e.preferredRoomType,
+        expectedMoveIn: e.moveInDate,
+        createdAt: e.createdAt,
+      }))
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    const maintenanceBedsList = allBeds
+      .filter((b) => b.status === 'MAINTENANCE')
+      .map((b) => {
+        const room = roomMap.get(b.roomId);
+        const prop = propMap.get(b.propertyId);
+        return {
+          bedId: b.id,
+          bedLabel: b.bedLabel,
+          roomNumber: room?.roomNumber || '',
+          propertyId: b.propertyId,
+          propertyName: prop?.name || '',
+          notes: b.notes || '',
+        };
+      });
 
     return res.json({
       periodLabel: formatMonthYear(latestPeriod.month, latestPeriod.year),
@@ -186,15 +282,31 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
         vacantBeds,
         reservedBeds,
         maintenanceBeds,
+        totalStudents,
         collectedThisMonth,
         pendingThisMonth,
         openComplaints,
         newLeads,
         pendingUpiApprovals,
       },
+      financialSummary: {
+        periodLabel: formatMonthYear(latestPeriod.month, latestPeriod.year),
+        monthlyIncome: collectedThisMonth,
+        monthlyExpenses: currentMonthExpenseTotal,
+        netProfit: collectedThisMonth - currentMonthExpenseTotal,
+      },
       revenueSeries,
-      overdueTenants,
+      overdueTenants: unpaidInvoices.slice(0, 6),
+      unpaidInvoices,
+      overdueTotalCount: unpaidInvoices.length,
       upcomingMoveOuts,
+      needsAttention: {
+        overdueInvoices: unpaidInvoices.filter((i) => i.status === 'OVERDUE'),
+        partialInvoices: unpaidInvoices.filter((i) => i.status === 'PARTIAL'),
+        unresolvedComplaints,
+        newEnquiries,
+        maintenanceBeds: maintenanceBedsList,
+      },
       properties: orgProperties.filter((p) => allowedIds.includes(p.id)),
     });
   } catch (err) {

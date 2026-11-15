@@ -6,7 +6,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { db, schema } from './src/db/index.ts';
 import { ensureSeeded } from './src/db/seed.ts';
+import { PLATFORM_ORG_SLUG } from './src/lib/platformAuth.ts';
 import { isDemoModeEnabled } from './src/lib/security.ts';
+import { ensureAdminBootstrapped } from './src/server/adminBootstrap.ts';
+import { accountRouter } from './src/server/routes/account.ts';
+import { adminRouter } from './src/server/routes/admin.ts';
 import { authRouter } from './src/server/routes/auth.ts';
 import { billingRouter } from './src/server/routes/billing.ts';
 import { cronRouter } from './src/server/routes/cron.ts';
@@ -27,10 +31,16 @@ async function startServer() {
   app.use(express.json({ limit: '8mb' }));
   app.use(cookieParser());
 
-  // Serve generated PG property imagery cleanly in both dev & prod
+  // Serve generated PG property imagery cleanly in both dev & prod (allow Vite ?import module requests through)
   const assetsImagesDir = path.resolve(process.cwd(), 'src/assets/images');
   if (fs.existsSync(assetsImagesDir)) {
-    app.use('/src/assets/images', express.static(assetsImagesDir));
+    const staticAssets = express.static(assetsImagesDir);
+    app.use('/src/assets/images', (req, res, next) => {
+      if ('import' in req.query || 'raw' in req.query) {
+        return next();
+      }
+      return staticAssets(req, res, next);
+    });
   }
 
   // API routes
@@ -38,7 +48,12 @@ async function startServer() {
     res.json({ ok: true, service: 'pgdesk' });
   });
 
+  await ensureSeeded().catch(() => {});
+  await ensureAdminBootstrapped().catch(() => {});
+
   app.use('/api/auth', authRouter);
+  app.use('/api/admin', adminRouter);
+  app.use('/api/account', accountRouter);
   app.use('/api/public', publicRouter);
   app.use('/api/dashboard', dashboardRouter);
   app.use('/api/properties', propertiesRouter);
@@ -60,10 +75,15 @@ async function startServer() {
         .innerJoin(schema.organizations, eq(schema.properties.organizationId, schema.organizations.id))
         .where(
           demoEnabled
-            ? and(eq(schema.properties.isPublic, true), isNull(schema.properties.deletedAt))
+            ? and(
+                eq(schema.properties.isPublic, true),
+                isNull(schema.properties.deletedAt),
+                ne(schema.organizations.slug, PLATFORM_ORG_SLUG)
+              )
             : and(
                 eq(schema.properties.isPublic, true),
                 isNull(schema.properties.deletedAt),
+                ne(schema.organizations.slug, PLATFORM_ORG_SLUG),
                 ne(schema.organizations.slug, 'sharma-residency')
               )
         );
@@ -89,7 +109,7 @@ async function startServer() {
   app.get('/robots.txt', (req, res) => {
     const baseUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
     res.type('text/plain');
-    res.send(`User-agent: *\nAllow: /\nAllow: /pg/\nDisallow: /dashboard\nDisallow: /tenant\nSitemap: ${baseUrl}/sitemap.xml\n`);
+    res.send(`User-agent: *\nAllow: /\nAllow: /pg/\nDisallow: /dashboard\nDisallow: /tenant\nDisallow: /admin\nSitemap: ${baseUrl}/sitemap.xml\n`);
   });
 
   // Vite middleware in dev, static dist in production

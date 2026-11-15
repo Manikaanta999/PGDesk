@@ -26,6 +26,7 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
     const pageSize = Math.min(100, Math.max(5, Number(req.query.pageSize || 25)));
     const statusFilter = String(req.query.status || 'ALL').toUpperCase();
     const propertyId = req.query.propertyId ? Number(req.query.propertyId) : null;
+    const monthFilter = String(req.query.month || '').trim();
     const search = String(req.query.search || '').trim().toLowerCase();
 
     const orgProps = await db
@@ -35,10 +36,18 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
 
     const allowedIds = getAllowedPropertyIds(user, orgProps.map((p) => p.id));
     if (allowedIds.length === 0) {
-      return res.json({ invoices: [], total: 0, page, pageSize, pendingApprovals: [] });
+      return res.json({
+        invoices: [],
+        total: 0,
+        page,
+        pageSize,
+        pendingApprovals: [],
+        availableMonths: [],
+        summary: { totalBilled: 0, totalCollected: 0, totalPending: 0, overdueCount: 0 },
+      });
     }
 
-    const [allInvoices, allTenants, allPayments, orgRows] = await Promise.all([
+    const [allInvoices, allTenants, allBeds, allRooms, allPayments, orgRows] = await Promise.all([
       db
         .select()
         .from(schema.invoices)
@@ -50,6 +59,8 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
         )
         .orderBy(desc(schema.invoices.periodYear), desc(schema.invoices.periodMonth), desc(schema.invoices.id)),
       db.select().from(schema.tenants).where(eq(schema.tenants.organizationId, user.organizationId)),
+      db.select().from(schema.beds).where(eq(schema.beds.organizationId, user.organizationId)),
+      db.select().from(schema.rooms).where(eq(schema.rooms.organizationId, user.organizationId)),
       db
         .select()
         .from(schema.payments)
@@ -60,16 +71,34 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
 
     const tenantMap = new Map(allTenants.map((t) => [t.id, t]));
     const propMap = new Map(orgProps.map((p) => [p.id, p]));
+    const bedMap = new Map(allBeds.map((b) => [b.id, b]));
+    const roomMap = new Map(allRooms.map((r) => [r.id, r]));
     const org = orgRows[0];
+
+    const monthOptionsMap = new Map<string, string>();
+    for (const inv of allInvoices) {
+      const key = `${inv.periodYear}-${String(inv.periodMonth).padStart(2, '0')}`;
+      if (!monthOptionsMap.has(key)) {
+        monthOptionsMap.set(key, formatMonthYear(inv.periodMonth, inv.periodYear));
+      }
+    }
+    const availableMonths = Array.from(monthOptionsMap.entries())
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([key, label]) => ({ key, label }));
 
     let rows = allInvoices.map((inv) => {
       const tenant = tenantMap.get(inv.tenantId);
       const prop = propMap.get(inv.propertyId);
+      const bed = tenant?.bedId ? bedMap.get(tenant.bedId) : undefined;
+      const room = bed ? roomMap.get(bed.roomId) : undefined;
       return {
         ...inv,
         tenantName: tenant?.name || 'Resident',
         tenantPhone: tenant?.phone || '',
         propertyName: prop?.name || '',
+        roomNumber: room?.roomNumber || '',
+        bedLabel: bed?.bedLabel || '',
+        periodKey: `${inv.periodYear}-${String(inv.periodMonth).padStart(2, '0')}`,
         periodLabel: formatMonthYear(inv.periodMonth, inv.periodYear),
         balanceDue: Math.max(0, inv.amount - inv.paidAmount),
         upiId: org?.upiId || 'pgdesk@okicici',
@@ -79,6 +108,9 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
     if (propertyId) {
       rows = rows.filter((r) => r.propertyId === propertyId);
     }
+    if (monthFilter) {
+      rows = rows.filter((r) => r.periodKey === monthFilter);
+    }
     if (statusFilter !== 'ALL') {
       rows = rows.filter((r) => r.status === statusFilter);
     }
@@ -87,9 +119,18 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
         (r) =>
           r.tenantName.toLowerCase().includes(search) ||
           r.invoiceNumber.toLowerCase().includes(search) ||
-          r.tenantPhone.includes(search)
+          r.tenantPhone.includes(search) ||
+          r.roomNumber.toLowerCase().includes(search) ||
+          r.bedLabel.toLowerCase().includes(search)
       );
     }
+
+    const summary = {
+      totalBilled: rows.reduce((s, r) => s + r.amount, 0),
+      totalCollected: rows.reduce((s, r) => s + r.paidAmount, 0),
+      totalPending: rows.reduce((s, r) => s + r.balanceDue, 0),
+      overdueCount: rows.filter((r) => r.status === 'OVERDUE').length,
+    };
 
     const pendingApprovals = allPayments
       .filter((p) => p.approvalStatus === 'PENDING_APPROVAL')
@@ -112,6 +153,8 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
       page,
       pageSize,
       pendingApprovals,
+      availableMonths,
+      summary,
     });
   } catch (err) {
     console.error('GET /api/billing/invoices error:', err);
@@ -191,6 +234,16 @@ billingRouter.post('/payments', requireAuth, requireRole('OWNER', 'MANAGER'), as
     }
     if (!canAccessProperty(user, invoice.propertyId)) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const balanceDue = Math.max(0, invoice.amount - invoice.paidAmount);
+    if (balanceDue <= 0) {
+      return res.status(400).json({ error: 'This invoice has already been paid in full.' });
+    }
+    if (parsed.data.amount > balanceDue) {
+      return res.status(400).json({
+        error: `Payment amount exceeds remaining balance of ₹${balanceDue.toLocaleString('en-IN')}.`,
+      });
     }
 
     const [payment] = await db

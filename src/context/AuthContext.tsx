@@ -9,7 +9,8 @@ export interface SessionUser {
   name: string;
   email: string;
   phone: string | null;
-  role: 'OWNER' | 'MANAGER' | 'TENANT';
+  photoUrl?: string | null;
+  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
   assignedPropertyIds: number[];
 }
 
@@ -31,20 +32,23 @@ export interface SessionOrg {
   phone: string;
   email: string;
   address: string;
+  bankDetails?: string;
+  paymentInstructions?: string;
 }
 
 export interface RegisterInput {
   accountType: 'OWNER' | 'TENANT';
+  ownerRegistrationToken?: string;
   name: string;
   organizationName?: string;
   email: string;
-  phone: string;
+  phone?: string;
   password: string;
 }
 
 export interface RegisterResult {
   user?: SessionUser;
-  requiresOtp?: boolean;
+  requiresEmailVerification?: boolean;
   email?: string;
   message?: string;
 }
@@ -58,11 +62,13 @@ interface AuthContextValue {
   darkMode: boolean;
   toggleDarkMode: () => void;
   refreshSession: () => Promise<SessionUser | null>;
+  applySessionToken: (token?: string, cookieOnly?: boolean) => void;
   loginWithCredentials: (identifier: string, password: string) => Promise<SessionUser>;
   registerAccount: (input: RegisterInput) => Promise<RegisterResult>;
-  verifyTenantOtp: (email: string, otp: string) => Promise<SessionUser>;
-  forgotPassword: (identifier: string) => Promise<{ ok: boolean; message: string }>;
-  resetPassword: (payload: { identifier: string; code: string; newPassword: string }) => Promise<{ ok: boolean; message: string }>;
+  verifyEmail: (email: string, code: string) => Promise<SessionUser>;
+  resendVerification: (email: string) => Promise<{ ok: boolean; message: string }>;
+  forgotPassword: (email: string) => Promise<{ ok: boolean; message: string }>;
+  resetPassword: (payload: { email: string; code: string; newPassword: string }) => Promise<{ ok: boolean; message: string }>;
   loginDemo: (role: 'OWNER' | 'MANAGER' | 'TENANT') => Promise<SessionUser>;
   loginWithGoogle: () => Promise<SessionUser | null>;
   logout: () => Promise<void>;
@@ -77,13 +83,17 @@ const AuthContext = createContext<AuthContextValue>({
   darkMode: false,
   toggleDarkMode: () => {},
   refreshSession: async () => null,
+  applySessionToken: () => {},
   loginWithCredentials: async () => {
     throw new Error('AuthProvider not mounted');
   },
   registerAccount: async () => {
     throw new Error('AuthProvider not mounted');
   },
-  verifyTenantOtp: async () => {
+  verifyEmail: async () => {
+    throw new Error('AuthProvider not mounted');
+  },
+  resendVerification: async () => {
     throw new Error('AuthProvider not mounted');
   },
   forgotPassword: async () => {
@@ -155,19 +165,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => unsub();
   }, [refreshSession]);
 
+  const applySessionToken = useCallback((token?: string, cookieOnly?: boolean) => {
+    if (cookieOnly || !token) {
+      setStoredToken(null);
+    } else {
+      setStoredToken(token);
+    }
+  }, []);
+
   const applyAuthResult = useCallback(
     (res: { user: SessionUser; organization?: SessionOrg | null; token?: string; cookieOnly?: boolean }) => {
-      if (res.cookieOnly || !res.token) {
-        setStoredToken(null);
-      } else {
-        setStoredToken(res.token);
-      }
+      applySessionToken(res.token, res.cookieOnly);
       setUser(res.user);
       setOrganization(res.organization ?? null);
       setLoading(false);
       return res.user;
     },
-    []
+    [applySessionToken]
   );
 
   const loginWithCredentials = useCallback(
@@ -199,16 +213,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         organization?: SessionOrg | null;
         token?: string;
         cookieOnly?: boolean;
-        requiresOtp?: boolean;
+        requiresEmailVerification?: boolean;
         email?: string;
         message?: string;
       }>('/api/auth/register', {
         method: 'POST',
         body: JSON.stringify(input),
       });
-      if (res.requiresOtp) {
+      if (res.requiresEmailVerification) {
         return {
-          requiresOtp: true,
+          requiresEmailVerification: true,
           email: res.email,
           message: res.message,
         };
@@ -227,31 +241,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [applyAuthResult]
   );
 
-  const verifyTenantOtp = useCallback(
-    async (email: string, otp: string): Promise<SessionUser> => {
+  const verifyEmail = useCallback(
+    async (email: string, code: string): Promise<SessionUser> => {
       const res = await apiFetch<{
         user: SessionUser;
         organization?: SessionOrg | null;
         token?: string;
         cookieOnly?: boolean;
-      }>('/api/auth/verify-otp', {
+      }>('/api/auth/verify-email', {
         method: 'POST',
-        body: JSON.stringify({ email, otp }),
+        body: JSON.stringify({ email, code }),
       });
       return applyAuthResult(res);
     },
     [applyAuthResult]
   );
 
-  const forgotPassword = useCallback(async (identifier: string) => {
+  const resendVerification = useCallback(async (email: string) => {
+    return apiFetch<{ ok: boolean; message: string }>('/api/auth/resend-verification', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+  }, []);
+
+  const forgotPassword = useCallback(async (email: string) => {
     return apiFetch<{ ok: boolean; message: string }>('/api/auth/forgot-password', {
       method: 'POST',
-      body: JSON.stringify({ identifier }),
+      body: JSON.stringify({ email }),
     });
   }, []);
 
   const resetPassword = useCallback(
-    async (payload: { identifier: string; code: string; newPassword: string }) => {
+    async (payload: { email: string; code: string; newPassword: string }) => {
       return apiFetch<{ ok: boolean; message: string }>('/api/auth/reset-password', {
         method: 'POST',
         body: JSON.stringify(payload),
@@ -284,6 +305,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       throw new Error('Google Sign-In is not configured for this deployment.');
     }
     setStoredToken(null);
+    await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     await signInWithPopup(auth, googleAuthProvider);
     return refreshSession();
   }, [refreshSession]);
@@ -311,9 +333,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         darkMode,
         toggleDarkMode,
         refreshSession,
+        applySessionToken,
         loginWithCredentials,
         registerAccount,
-        verifyTenantOtp,
+        verifyEmail,
+        resendVerification,
         forgotPassword,
         resetPassword,
         loginDemo,

@@ -30,7 +30,7 @@ export interface StorageProvider {
     mimeType: string;
     base64Data: string;
     organizationId: number;
-    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties';
+    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties' | 'avatars';
   }): Promise<StoredFileMeta>;
   readFileBuffer(storageKey: string, contentBase64?: string | null): Promise<Buffer | null>;
   getSignedDownloadUrl?(storageKey: string, expiresSeconds?: number): Promise<string | null>;
@@ -78,7 +78,7 @@ class LocalDiskAndDbStorageProvider implements StorageProvider {
     mimeType: string;
     base64Data: string;
     organizationId: number;
-    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties';
+    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties' | 'avatars';
   }): Promise<StoredFileMeta> {
     const { buffer, cleanedBase64, safeExt, safeFileName } = parseValidatedUpload(params);
     const storageKey = buildStorageKey(params.organizationId, params.folder, safeExt);
@@ -182,7 +182,7 @@ class S3SignedStorageProvider implements StorageProvider {
     mimeType: string;
     base64Data: string;
     organizationId: number;
-    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties';
+    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties' | 'avatars';
   }): Promise<StoredFileMeta> {
     const { buffer, safeExt, safeFileName } = parseValidatedUpload(params);
     const storageKey = buildStorageKey(params.organizationId, params.folder, safeExt);
@@ -280,7 +280,7 @@ class GcsSignedStorageProvider implements StorageProvider {
     mimeType: string;
     base64Data: string;
     organizationId: number;
-    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties';
+    folder: 'id-docs' | 'complaints' | 'receipts' | 'properties' | 'avatars';
   }): Promise<StoredFileMeta> {
     const { buffer, safeExt, safeFileName } = parseValidatedUpload(params);
     const storageKey = buildStorageKey(params.organizationId, params.folder, safeExt);
