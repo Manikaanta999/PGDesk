@@ -30,7 +30,7 @@ import {
   resolveAuthUser,
   SESSION_COOKIE_NAME,
 } from '../../middleware/auth.ts';
-import { ensureAdminBootstrapped, ensurePlatformOrg } from '../adminBootstrap.ts';
+import { ensurePlatformOrg } from '../adminBootstrap.ts';
 import { logAudit } from '../audit.ts';
 
 function toSlug(input: string): string {
@@ -80,7 +80,6 @@ authRouter.get('/config', (_req, res) => {
 authRouter.get('/me', async (req, res) => {
   try {
     await ensureSeeded();
-    await ensureAdminBootstrapped();
     const demoModeEnabled = isDemoModeEnabled();
     const resolved = await resolveAuthUser(req);
     const user = resolved?.user ?? null;
@@ -105,7 +104,6 @@ authRouter.get('/me', async (req, res) => {
 authRouter.post('/register', async (req, res) => {
   try {
     await ensureSeeded();
-    await ensureAdminBootstrapped();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`register:${ip}`, 15, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many signup attempts. Please try again shortly.' });
@@ -428,7 +426,6 @@ authRouter.post('/resend-verification', async (req, res) => {
 authRouter.post('/forgot-password', async (req, res) => {
   try {
     await ensureSeeded();
-    await ensureAdminBootstrapped();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`forgot-pwd:${ip}`, 10, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many reset requests. Please try again later.' });
@@ -544,7 +541,6 @@ authRouter.post('/reset-password', async (req, res) => {
 authRouter.post('/login', async (req, res) => {
   try {
     await ensureSeeded();
-    await ensureAdminBootstrapped();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`login:${ip}`, 25, 10 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many login attempts. Please wait a few minutes.' });
@@ -561,7 +557,19 @@ authRouter.post('/login', async (req, res) => {
       digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
 
     const found = await db
-      .select()
+      .select({
+        id: schema.users.id,
+        organizationId: schema.users.organizationId,
+        name: schema.users.name,
+        email: schema.users.email,
+        phone: schema.users.phone,
+        photoUrl: schema.users.photoUrl,
+        passwordHash: schema.users.passwordHash,
+        role: schema.users.role,
+        assignedPropertyIds: schema.users.assignedPropertyIds,
+        isActive: schema.users.isActive,
+        emailVerified: schema.users.emailVerified,
+      })
       .from(schema.users)
       .where(
         normalizedPhone.length === 10
@@ -583,10 +591,21 @@ authRouter.post('/login', async (req, res) => {
       });
     }
 
-    await db
-      .update(schema.users)
-      .set({ lastLoginAt: new Date(), updatedAt: new Date() })
-      .where(eq(schema.users.id, user.id));
+    try {
+      await db
+        .update(schema.users)
+        .set({ lastLoginAt: new Date(), updatedAt: new Date() })
+        .where(eq(schema.users.id, user.id));
+    } catch (err) {
+      const error = err as { code?: string; message?: string };
+      if (error.code !== '42703') {
+        throw err;
+      }
+      console.warn('Skipping last-login timestamp because the database column is not available yet:', {
+        code: error.code,
+        message: error.message,
+      });
+    }
 
     if (user.role === 'ADMIN') {
       await logAudit({

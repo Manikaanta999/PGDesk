@@ -45,7 +45,16 @@ export async function isAdminBootstrapLocked(): Promise<boolean> {
   return Boolean(rows[0]);
 }
 
-export async function ensureAdminBootstrapped(): Promise<void> {
+let bootstrapPromise: Promise<void> | null = null;
+
+export function ensureAdminBootstrapped(): Promise<void> {
+  if (!bootstrapPromise) {
+    bootstrapPromise = runAdminBootstrap();
+  }
+  return bootstrapPromise;
+}
+
+async function runAdminBootstrap(): Promise<void> {
   let adminPool: Pool | null = null;
   try {
     const runtimeRole = process.env.SQL_USER || process.env.SQL_ADMIN_USER;
@@ -74,6 +83,7 @@ export async function ensureAdminBootstrapped(): Promise<void> {
       sql`DO $$ BEGIN ALTER TYPE enquiry_status ADD VALUE IF NOT EXISTS 'REJECTED'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
       sql`DO $$ BEGIN ALTER TYPE enquiry_status ADD VALUE IF NOT EXISTS 'CONVERTED_TO_STUDENT'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
       sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS uid text;`,
+      sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url text;`,
       sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified boolean NOT NULL DEFAULT false;`,
       sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_token_hash text;`,
       sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_expires_at timestamp;`,
