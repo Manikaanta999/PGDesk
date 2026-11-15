@@ -46,8 +46,23 @@ async function startServer() {
     res.json({ ok: true, service: 'pgdesk' });
   });
 
-  await ensureSeeded().catch(() => {});
-  await ensureAdminBootstrapped();
+  void ensureSeeded().catch((err) => {
+    console.error('Demo seed failed:', err);
+  });
+
+  let bootstrapError: unknown = null;
+  const bootstrapPromise = ensureAdminBootstrapped().catch((err) => {
+    bootstrapError = err;
+    console.error('Admin bootstrap failed; API requests will remain unavailable:', err);
+  });
+
+  app.use('/api', async (_req, res, next) => {
+    await bootstrapPromise;
+    if (bootstrapError) {
+      return res.status(503).json({ error: 'Database initialization failed. Check server logs.' });
+    }
+    return next();
+  });
 
   app.use('/api/auth', authRouter);
   app.use('/api/admin', adminRouter);
