@@ -618,7 +618,12 @@ authRouter.post('/login', async (req, res) => {
       organization: org,
     });
   } catch (err) {
-    console.error('POST /api/auth/login error:', err);
+    const error = err as { message?: string; code?: string };
+    console.error('POST /api/auth/login error:', {
+      message: error.message,
+      code: error.code,
+      error: err,
+    });
     return res.status(500).json({ error: 'Login failed' });
   }
 });

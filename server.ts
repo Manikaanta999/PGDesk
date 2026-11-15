@@ -1,5 +1,5 @@
 import cookieParser from 'cookie-parser';
-import * as dotenv from 'dotenv';
+import 'dotenv/config';
 import { and, eq, isNull, ne } from 'drizzle-orm';
 import express from 'express';
 import fs from 'node:fs';
@@ -20,8 +20,6 @@ import { propertiesRouter } from './src/server/routes/properties.ts';
 import { publicRouter } from './src/server/routes/public.ts';
 import { tenantPortalRouter } from './src/server/routes/tenantPortal.ts';
 import { tenantsRouter } from './src/server/routes/tenants.ts';
-
-dotenv.config();
 
 async function startServer() {
   const app = express();
@@ -49,7 +47,7 @@ async function startServer() {
   });
 
   await ensureSeeded().catch(() => {});
-  await ensureAdminBootstrapped().catch(() => {});
+  await ensureAdminBootstrapped();
 
   app.use('/api/auth', authRouter);
   app.use('/api/admin', adminRouter);

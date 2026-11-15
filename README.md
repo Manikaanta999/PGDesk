@@ -33,3 +33,6 @@ npm run dev      # Starts Express + Vite on http://localhost:3000
 
 ## Environment Variables
 See `.env.example` for Cloud SQL (`SQL_HOST`, `SQL_DB_NAME`, `SQL_USER`, `SQL_PASSWORD`, `SQL_ADMIN_USER`, `SQL_ADMIN_PASSWORD`), `SESSION_SECRET`, `APP_URL`, and `STORAGE_DRIVER`.
+
+For local demo logins, copy `.env.example` to `.env` and set `ENABLE_DEMO_MODE="true"`.
+This enables the seeded accounts listed above; keep it disabled in production.

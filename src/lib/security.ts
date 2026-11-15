@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import crypto from 'node:crypto';
 
 const SESSION_SECRET =
@@ -101,4 +102,3 @@ export function verifyCronSecret(authHeader: string | undefined, expectedSecret:
   if (a.length === 0 || a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
-

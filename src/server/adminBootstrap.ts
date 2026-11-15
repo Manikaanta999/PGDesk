@@ -1,4 +1,6 @@
-import { and, eq,sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
 import { db, schema } from '../db/index.ts';
 import { ADMIN_PRIMARY_EMAIL, PLATFORM_ORG_SLUG } from '../lib/platformAuth.ts';
 import { hashPassword } from '../lib/security.ts';
@@ -45,7 +47,21 @@ export async function isAdminBootstrapLocked(): Promise<boolean> {
 
 export async function ensureAdminBootstrapped(): Promise<void> {
   try {
-   const migrationStatements = [
+    const runtimeRole = process.env.SQL_USER || process.env.SQL_ADMIN_USER;
+    if (!runtimeRole) {
+      throw new Error('SQL_USER or SQL_ADMIN_USER must be configured');
+    }
+    const adminPool = new Pool({
+      host: process.env.SQL_HOST,
+      user: process.env.SQL_ADMIN_USER || process.env.SQL_USER,
+      password: process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD,
+      database: process.env.SQL_DB_NAME,
+      max: 1,
+      connectionTimeoutMillis: 15000,
+    });
+    const adminDb = drizzle(adminPool, { schema });
+
+    const migrationStatements = [
       sql`DO $$ BEGIN ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'ADMIN'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
       sql`DO $$ BEGIN CREATE TYPE owner_token_status AS ENUM ('UNUSED', 'USED', 'EXPIRED', 'REVOKED'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
       sql`DO $$ BEGIN CREATE TYPE account_link_status AS ENUM ('NO_ACCOUNT', 'ACCOUNT_CREATED', 'LINK_PENDING', 'LINKED', 'LINK_REJECTED'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;`,
@@ -116,14 +132,23 @@ export async function ensureAdminBootstrapped(): Promise<void> {
       sql`UPDATE enquiries SET status = 'NEW_ENQUIRY' WHERE status::text = 'NEW';`,
       sql`UPDATE enquiries SET status = 'CONVERTED_TO_STUDENT' WHERE status::text = 'CONVERTED';`,
       sql`ALTER TABLE enquiries ALTER COLUMN status SET DEFAULT 'NEW_ENQUIRY';`,
+      sql`GRANT USAGE ON SCHEMA public TO ${sql.raw(quoteIdentifier(runtimeRole))};`,
+      sql`GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${sql.raw(quoteIdentifier(runtimeRole))};`,
+      sql`GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${sql.raw(quoteIdentifier(runtimeRole))};`,
+      sql`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${sql.raw(
+        quoteIdentifier(runtimeRole)
+      )};`,
+      sql`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${sql.raw(
+        quoteIdentifier(runtimeRole)
+      )};`,
     ];
 
-    for (const stmt of migrationStatements) {
-      try {
-        await db.execute(stmt);
-      } catch (migrationErr) {
-        console.error('[SchemaSync] Statement failed:', migrationErr);
+    try {
+      for (const stmt of migrationStatements) {
+        await adminDb.execute(stmt);
       }
+    } finally {
+      await adminPool.end();
     }
     const platformOrg = await ensurePlatformOrg();
     const locked = await isAdminBootstrapLocked();
@@ -199,7 +224,15 @@ export async function ensureAdminBootstrapped(): Promise<void> {
     }
   } catch (err) {
     console.error('Admin bootstrap check failed:', err);
+    throw err;
   }
+}
+
+function quoteIdentifier(identifier: string): string {
+  if (!/^[a-zA-Z_][a-zA-Z0-9_$]*$/.test(identifier)) {
+    throw new Error('SQL_USER must be a valid PostgreSQL role name');
+  }
+  return `"${identifier}"`;
 }
 
 export async function getAdminBootstrapStatus() {
