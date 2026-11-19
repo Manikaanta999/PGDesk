@@ -35,11 +35,19 @@ interface InvoiceRow {
   paidAmount: number;
   balanceDue: number;
   dueDate: string;
-  status: 'PAID' | 'PENDING' | 'OVERDUE' | 'PARTIAL';
+  status: 'PAID' | 'PENDING' | 'UNPAID' | 'OVERDUE' | 'PARTIAL';
   isProRata: boolean;
   items?: InvoiceLineItem[];
   notes?: string | null;
   upiId: string;
+  approvedPaymentCount?: number;
+  payments?: Array<{
+    id: number;
+    amount: number;
+    method: string;
+    reference: string;
+    paidAt: string;
+  }>;
 }
 
 interface PendingApproval {
@@ -78,7 +86,7 @@ export function BillingPage() {
 
   const initialStatus = String(searchParams.get('status') || 'ALL').toUpperCase();
   const [statusFilter, setStatusFilter] = useState(
-    ['ALL', 'OVERDUE', 'PENDING', 'PARTIAL', 'PAID'].includes(initialStatus) ? initialStatus : 'ALL'
+    ['ALL', 'OVERDUE', 'UNPAID', 'PENDING', 'PARTIAL', 'PAID'].includes(initialStatus) ? initialStatus : 'ALL'
   );
   const [propertyFilter, setPropertyFilter] = useState('');
   const [monthFilter, setMonthFilter] = useState('');
@@ -97,6 +105,7 @@ export function BillingPage() {
   const [payMethod, setPayMethod] = useState<'UPI' | 'CASH' | 'BANK' | 'ONLINE'>('UPI');
   const [payRef, setPayRef] = useState('');
   const [payDate, setPayDate] = useState(new Date().toISOString().slice(0, 10));
+  const [payIdempotencyKey, setPayIdempotencyKey] = useState('');
   const [recording, setRecording] = useState(false);
 
   // Invoice Detail Modal
@@ -165,6 +174,9 @@ export function BillingPage() {
     setPayMethod('UPI');
     setPayRef('');
     setPayDate(new Date().toISOString().slice(0, 10));
+    setPayIdempotencyKey(
+      typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `pay-${inv.id}-${Date.now()}`
+    );
   };
 
   const handleRecordPayment = async (e: React.FormEvent) => {
@@ -185,10 +197,12 @@ export function BillingPage() {
           method: payMethod,
           reference: payRef,
           paidAt: payDate,
+          idempotencyKey: payIdempotencyKey || undefined,
         }),
       });
       showToast(`Payment of ${formatINR(payAmount)} recorded`);
       setPayTarget(null);
+      setPayIdempotencyKey('');
       await loadBilling();
     } catch (err: any) {
       showToast(err.message || 'Payment entry failed', 'error');
@@ -333,15 +347,19 @@ export function BillingPage() {
                   )}
                 </>
               )}
-              <button
-                type="button"
-                onClick={() => handleDownloadPdf(inv)}
-                aria-label={`Download PDF receipt for ${inv.invoiceNumber}`}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>PDF</span>
-              </button>
+              {inv.paidAmount > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => handleDownloadPdf(inv)}
+                  aria-label={`Download PDF receipt for ${inv.invoiceNumber}`}
+                  className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>PDF</span>
+                </button>
+              ) : (
+                <span className="px-1.5 text-[11px] text-slate-400">No receipt</span>
+              )}
             </div>
           );
         },
@@ -563,14 +581,18 @@ export function BillingPage() {
                     )}
                   </>
                 )}
-                <button
-                  type="button"
-                  onClick={() => handleDownloadPdf(inv)}
-                  className="inline-flex min-h-[38px] items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  <span>PDF</span>
-                </button>
+                {inv.paidAmount > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPdf(inv)}
+                    className="inline-flex min-h-[38px] items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>PDF</span>
+                  </button>
+                ) : (
+                  <span className="px-2 text-[11px] text-slate-400">No receipt</span>
+                )}
               </div>
             </div>
           )}
@@ -610,7 +632,7 @@ export function BillingPage() {
               >
                 <option value="ALL">All Statuses</option>
                 <option value="OVERDUE">Overdue</option>
-                <option value="PENDING">Pending</option>
+                <option value="UNPAID">Unpaid</option>
                 <option value="PARTIAL">Partially Paid</option>
                 <option value="PAID">Paid</option>
               </select>
@@ -715,15 +737,40 @@ export function BillingPage() {
               <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">Note: {viewTarget.notes}</p>
             )}
 
+            {viewTarget.payments && viewTarget.payments.length > 0 && (
+              <div className="mt-4 rounded-lg border border-slate-200 p-3.5 text-xs dark:border-slate-800">
+                <p className="font-semibold text-slate-700 dark:text-slate-300">Approved Payment Transactions</p>
+                <div className="mt-2 space-y-1.5">
+                  {viewTarget.payments.map((p) => (
+                    <div key={p.id} className="flex items-center justify-between gap-2">
+                      <span className="text-slate-600 dark:text-slate-400">
+                        {formatDateIN(p.paidAt)} · {p.method}
+                        {p.reference ? ` · ${p.reference}` : ''}
+                      </span>
+                      <span className="font-mono font-semibold tabular-nums text-emerald-700 dark:text-emerald-400">
+                        {formatINR(p.amount)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className="mt-6 flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => handleDownloadPdf(viewTarget)}
-                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Download Receipt PDF</span>
-              </button>
+              {viewTarget.paidAmount > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => handleDownloadPdf(viewTarget)}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>Download Receipt PDF</span>
+                </button>
+              ) : (
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  Receipt available after payment is recorded.
+                </span>
+              )}
               {viewTarget.balanceDue > 0 && (
                 <button
                   type="button"

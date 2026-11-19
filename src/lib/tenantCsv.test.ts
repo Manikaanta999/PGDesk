@@ -9,9 +9,10 @@ import {
   type TenantCsvRow,
 } from './tenantCsv.ts';
 
-test('formatTenantPaymentStatus classifies Paid vs Pending Dues accurately', () => {
+test('formatTenantPaymentStatus classifies Paid vs Pending Dues vs Unpaid accurately', () => {
   assert.equal(formatTenantPaymentStatus(0), 'Paid');
   assert.equal(formatTenantPaymentStatus(-100), 'Paid');
+  assert.equal(formatTenantPaymentStatus(0, false), 'Unpaid');
   assert.equal(formatTenantPaymentStatus(1), 'Pending Dues');
   assert.equal(formatTenantPaymentStatus(12500), 'Pending Dues');
 });

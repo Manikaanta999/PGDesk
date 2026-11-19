@@ -27,7 +27,7 @@ import { DashboardLayout } from '../../components/layout/DashboardLayout';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
-import { apiFetch } from '../../lib/api';
+import { ApiError, apiFetch } from '../../lib/api';
 import {
   buildBedStatusBreakdown,
   formatComplaintCategory,
@@ -142,12 +142,13 @@ interface DashboardResponse {
 }
 
 export function OverviewPage() {
-  const { user, organization } = useAuth();
+  const { user, organization, refreshSession, logout } = useAuth();
   const { tHeading } = useLanguage();
   const { showToast } = useToast();
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [selectedPropertyId, setSelectedPropertyId] = useState<string>('');
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const [payModalOpen, setPayModalOpen] = useState(false);
   const [payTarget, setPayTarget] = useState<OverdueTenantItem | null>(null);
@@ -157,20 +158,27 @@ export function OverviewPage() {
     reference: '',
     paidAt: new Date().toISOString().slice(0, 10),
   });
+  const [payIdempotencyKey, setPayIdempotencyKey] = useState('');
   const [savingPay, setSavingPay] = useState(false);
 
   const loadDashboard = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     const qs = selectedPropertyId ? `?propertyId=${selectedPropertyId}` : '';
     try {
       const res = await apiFetch<DashboardResponse>(`/api/dashboard${qs}`);
       setData(res);
-    } catch {
-      // handled gracefully in empty state
+    } catch (err: any) {
+      const msg = err?.message || 'Could not load owner dashboard';
+      setLoadError(msg);
+      showToast(msg, 'error');
+      if (err instanceof ApiError && err.status === 401) {
+        await refreshSession();
+      }
     } finally {
       setLoading(false);
     }
-  }, [selectedPropertyId]);
+  }, [refreshSession, selectedPropertyId, showToast]);
 
   useEffect(() => {
     loadDashboard();
@@ -187,6 +195,11 @@ export function OverviewPage() {
       reference: '',
       paidAt: new Date().toISOString().slice(0, 10),
     });
+    setPayIdempotencyKey(
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `ov-${chosen?.invoiceId || 0}-${Date.now()}`
+    );
     setPayModalOpen(true);
   };
 
@@ -197,6 +210,11 @@ export function OverviewPage() {
       ...f,
       amount: found ? found.balanceDue : 0,
     }));
+    setPayIdempotencyKey(
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `ov-${found?.invoiceId || 0}-${Date.now()}`
+    );
   };
 
   const handleRecordPayment = async (e: React.FormEvent) => {
@@ -217,11 +235,13 @@ export function OverviewPage() {
           method: payForm.method,
           reference: payForm.reference,
           paidAt: payForm.paidAt,
+          idempotencyKey: payIdempotencyKey || undefined,
         }),
       });
       showToast(`Recorded ${formatINR(payForm.amount)} from ${payTarget.tenantName}`);
       setPayModalOpen(false);
       setPayTarget(null);
+      setPayIdempotencyKey('');
       await loadDashboard();
     } catch (err: any) {
       showToast(err.message || 'Failed to record payment', 'error');
@@ -281,7 +301,7 @@ export function OverviewPage() {
         </div>
       }
     >
-      {loading || !data ? (
+      {loading ? (
         <div className="space-y-4">
           <div className="h-20 animate-pulse rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" />
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -293,6 +313,31 @@ export function OverviewPage() {
             {[1, 2, 3, 4].map((i) => (
               <div key={i} className="h-28 animate-pulse rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" />
             ))}
+          </div>
+        </div>
+      ) : loadError || !data ? (
+        <div className="mx-auto max-w-lg rounded-2xl border border-red-200 bg-white p-6 text-center dark:border-red-900/50 dark:bg-slate-900">
+          <h2 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+            Unable to Load Owner Dashboard
+          </h2>
+          <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
+            {loadError || 'Your session could not be verified. Please sign in again.'}
+          </p>
+          <div className="mt-5 flex flex-wrap justify-center gap-3">
+            <button
+              type="button"
+              onClick={loadDashboard}
+              className="inline-flex min-h-[44px] items-center rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800"
+            >
+              Try Again
+            </button>
+            <button
+              type="button"
+              onClick={logout}
+              className="inline-flex min-h-[44px] items-center rounded-lg border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              Sign In Again
+            </button>
           </div>
         </div>
       ) : (

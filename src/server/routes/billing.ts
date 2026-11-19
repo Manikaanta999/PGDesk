@@ -2,7 +2,10 @@ import { Router } from 'express';
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import {
+  canDownloadInvoiceReceipt,
+  computeApprovedPaidAmount,
   deriveInvoiceStatus,
+  reconcileInvoiceWithPayments,
 } from '../../lib/billing.ts';
 import { formatDateIN, formatMonthYear } from '../../lib/format.ts';
 import { generateReceiptPdfBytes } from '../../lib/pdfReceipt.ts';
@@ -16,6 +19,14 @@ import {
 } from '../../middleware/auth.ts';
 import { logAudit } from '../audit.ts';
 import { runBillingCycleForOrg } from '../billingEngine.ts';
+
+class BillingHttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
 
 export const billingRouter = Router();
 
@@ -74,6 +85,14 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
     const bedMap = new Map(allBeds.map((b) => [b.id, b]));
     const roomMap = new Map(allRooms.map((r) => [r.id, r]));
     const org = orgRows[0];
+    const todayStr = new Date().toISOString().slice(0, 10);
+
+    const paymentsByInvoice = new Map<number, typeof allPayments>();
+    for (const p of allPayments) {
+      const arr = paymentsByInvoice.get(p.invoiceId) ?? [];
+      arr.push(p);
+      paymentsByInvoice.set(p.invoiceId, arr);
+    }
 
     const monthOptionsMap = new Map<string, string>();
     for (const inv of allInvoices) {
@@ -91,8 +110,15 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
       const prop = propMap.get(inv.propertyId);
       const bed = tenant?.bedId ? bedMap.get(tenant.bedId) : undefined;
       const room = bed ? roomMap.get(bed.roomId) : undefined;
+      const invPayments = paymentsByInvoice.get(inv.id) ?? [];
+      const reconciled = reconcileInvoiceWithPayments(inv, invPayments, todayStr);
       return {
         ...inv,
+        paidAmount: reconciled.paidAmount,
+        status: reconciled.status,
+        balanceDue: reconciled.balanceDue,
+        approvedPaymentCount: reconciled.approvedCount,
+        payments: invPayments.filter((p) => p.approvalStatus === 'APPROVED'),
         tenantName: tenant?.name || 'Resident',
         tenantPhone: tenant?.phone || '',
         propertyName: prop?.name || '',
@@ -100,7 +126,6 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
         bedLabel: bed?.bedLabel || '',
         periodKey: `${inv.periodYear}-${String(inv.periodMonth).padStart(2, '0')}`,
         periodLabel: formatMonthYear(inv.periodMonth, inv.periodYear),
-        balanceDue: Math.max(0, inv.amount - inv.paidAmount),
         upiId: org?.upiId || 'pgdesk@okicici',
       };
     });
@@ -112,7 +137,11 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
       rows = rows.filter((r) => r.periodKey === monthFilter);
     }
     if (statusFilter !== 'ALL') {
-      rows = rows.filter((r) => r.status === statusFilter);
+      if (statusFilter === 'UNPAID' || statusFilter === 'PENDING') {
+        rows = rows.filter((r) => r.status === 'UNPAID' || (r.status as string) === 'PENDING');
+      } else {
+        rows = rows.filter((r) => r.status === statusFilter);
+      }
     }
     if (search) {
       rows = rows.filter(
@@ -132,11 +161,17 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
       overdueCount: rows.filter((r) => r.status === 'OVERDUE').length,
     };
 
+    const allowedPropSet = new Set(allowedIds);
+    const invMap = new Map(allInvoices.map((i) => [i.id, i]));
     const pendingApprovals = allPayments
-      .filter((p) => p.approvalStatus === 'PENDING_APPROVAL')
+      .filter((p) => {
+        if (p.approvalStatus !== 'PENDING_APPROVAL') return false;
+        const inv = invMap.get(p.invoiceId);
+        return Boolean(inv && allowedPropSet.has(inv.propertyId));
+      })
       .map((p) => {
         const tenant = tenantMap.get(p.tenantId);
-        const inv = allInvoices.find((i) => i.id === p.invoiceId);
+        const inv = invMap.get(p.invoiceId);
         return {
           ...p,
           tenantName: tenant?.name || 'Resident',
@@ -223,70 +258,126 @@ billingRouter.post('/payments', requireAuth, requireRole('OWNER', 'MANAGER'), as
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payment payload' });
     }
 
-    const [invoice] = await db
-      .select()
-      .from(schema.invoices)
-      .where(and(eq(schema.invoices.id, parsed.data.invoiceId), eq(schema.invoices.organizationId, user.organizationId)))
-      .limit(1);
-
-    if (!invoice) {
-      return res.status(404).json({ error: 'Invoice not found' });
-    }
-    if (!canAccessProperty(user, invoice.propertyId)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const balanceDue = Math.max(0, invoice.amount - invoice.paidAmount);
-    if (balanceDue <= 0) {
-      return res.status(400).json({ error: 'This invoice has already been paid in full.' });
-    }
-    if (parsed.data.amount > balanceDue) {
-      return res.status(400).json({
-        error: `Payment amount exceeds remaining balance of ₹${balanceDue.toLocaleString('en-IN')}.`,
-      });
-    }
-
-    const [payment] = await db
-      .insert(schema.payments)
-      .values({
-        organizationId: user.organizationId,
-        invoiceId: invoice.id,
-        tenantId: invoice.tenantId,
-        amount: parsed.data.amount,
-        method: parsed.data.method,
-        reference: parsed.data.reference,
-        approvalStatus: 'APPROVED',
-        paidAt: parsed.data.paidAt,
-        recordedByUserId: user.id,
-        notes: parsed.data.notes || null,
-      })
-      .returning();
-
-    const newPaid = invoice.paidAmount + parsed.data.amount;
+    const d = parsed.data;
     const todayStr = new Date().toISOString().slice(0, 10);
-    const nextStatus = deriveInvoiceStatus({
-      amount: invoice.amount,
-      paidAmount: newPaid,
-      dueDate: invoice.dueDate,
-      asOfDate: todayStr,
-    });
 
-    const [updatedInvoice] = await db
-      .update(schema.invoices)
-      .set({ paidAmount: newPaid, status: nextStatus, updatedAt: new Date() })
-      .where(eq(schema.invoices.id, invoice.id))
-      .returning();
+    const result = await db.transaction(async (tx) => {
+      if (d.idempotencyKey) {
+        const [dupByKey] = await tx
+          .select()
+          .from(schema.payments)
+          .where(
+            and(
+              eq(schema.payments.organizationId, user.organizationId),
+              eq(schema.payments.idempotencyKey, d.idempotencyKey)
+            )
+          )
+          .limit(1);
+        if (dupByKey) {
+          throw new BillingHttpError(409, 'Duplicate payment submission prevented. This payment was already recorded.');
+        }
+      }
+
+      const [invoice] = await tx
+        .select()
+        .from(schema.invoices)
+        .where(and(eq(schema.invoices.id, d.invoiceId), eq(schema.invoices.organizationId, user.organizationId)))
+        .for('update')
+        .limit(1);
+
+      if (!invoice) {
+        throw new BillingHttpError(404, 'Invoice not found');
+      }
+      if (!canAccessProperty(user, invoice.propertyId)) {
+        throw new BillingHttpError(403, 'Access denied');
+      }
+
+      const existingPayments = await tx
+        .select()
+        .from(schema.payments)
+        .where(
+          and(
+            eq(schema.payments.invoiceId, invoice.id),
+            eq(schema.payments.organizationId, user.organizationId)
+          )
+        );
+
+      const recentCutoff = new Date(Date.now() - 15_000);
+      const hasRecentIdentical = existingPayments.some(
+        (p) =>
+          p.approvalStatus === 'APPROVED' &&
+          p.amount === d.amount &&
+          p.method === d.method &&
+          p.paidAt === d.paidAt &&
+          (p.reference || '') === (d.reference || '') &&
+          new Date(p.createdAt) >= recentCutoff
+      );
+      if (hasRecentIdentical) {
+        throw new BillingHttpError(409, 'Duplicate payment submission prevented. Identical payment recorded moments ago.');
+      }
+
+      const currentPaid = computeApprovedPaidAmount(existingPayments);
+      const balanceDue = Math.max(0, invoice.amount - currentPaid);
+      if (balanceDue <= 0) {
+        throw new BillingHttpError(400, 'This invoice has already been paid in full.');
+      }
+      if (d.amount > balanceDue) {
+        throw new BillingHttpError(
+          400,
+          `Payment amount exceeds remaining balance of ₹${balanceDue.toLocaleString('en-IN')}.`
+        );
+      }
+
+      const [payment] = await tx
+        .insert(schema.payments)
+        .values({
+          organizationId: user.organizationId,
+          invoiceId: invoice.id,
+          tenantId: invoice.tenantId,
+          amount: d.amount,
+          method: d.method,
+          reference: d.reference,
+          approvalStatus: 'APPROVED',
+          paidAt: d.paidAt,
+          recordedByUserId: user.id,
+          idempotencyKey: d.idempotencyKey || null,
+          notes: d.notes || null,
+        })
+        .returning();
+
+      const newPaid = currentPaid + d.amount;
+      const nextStatus = deriveInvoiceStatus({
+        amount: invoice.amount,
+        paidAmount: newPaid,
+        dueDate: invoice.dueDate,
+        asOfDate: todayStr,
+      });
+
+      const [updatedInvoice] = await tx
+        .update(schema.invoices)
+        .set({ paidAmount: newPaid, status: nextStatus, updatedAt: new Date() })
+        .where(eq(schema.invoices.id, invoice.id))
+        .returning();
+
+      return { payment, invoice: updatedInvoice };
+    });
 
     await logAudit({
       user,
       action: 'PAYMENT_RECORDED',
       entityType: 'PAYMENT',
-      entityId: payment.id,
-      metadata: { invoiceId: invoice.id, amount: parsed.data.amount, method: parsed.data.method },
+      entityId: result.payment.id,
+      metadata: { invoiceId: result.invoice.id, amount: d.amount, method: d.method },
     });
 
-    return res.status(201).json({ payment, invoice: updatedInvoice });
-  } catch (err) {
+    return res.status(201).json(result);
+  } catch (err: any) {
+    if (err instanceof BillingHttpError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    if (err?.code === '23505' || err?.cause?.code === '23505') {
+      return res.status(409).json({ error: 'Duplicate payment submission prevented.' });
+    }
     console.error('POST /api/billing/payments error:', err);
     return res.status(500).json({ error: 'Failed to record payment' });
   }
@@ -301,60 +392,84 @@ billingRouter.post('/payments/:id/review', requireAuth, requireRole('OWNER', 'MA
       return res.status(400).json({ error: 'Decision must be APPROVE or REJECT' });
     }
 
-    const [payment] = await db
-      .select()
-      .from(schema.payments)
-      .where(and(eq(schema.payments.id, paymentId), eq(schema.payments.organizationId, user.organizationId)))
-      .limit(1);
+    const result = await db.transaction(async (tx) => {
+      const [payment] = await tx
+        .select()
+        .from(schema.payments)
+        .where(and(eq(schema.payments.id, paymentId), eq(schema.payments.organizationId, user.organizationId)))
+        .for('update')
+        .limit(1);
 
-    if (!payment || payment.approvalStatus !== 'PENDING_APPROVAL') {
-      return res.status(404).json({ error: 'Pending payment submission not found' });
-    }
+      if (!payment || payment.approvalStatus !== 'PENDING_APPROVAL') {
+        throw new BillingHttpError(404, 'Pending payment submission not found or already reviewed');
+      }
 
-    const [invoice] = await db
-      .select()
-      .from(schema.invoices)
-      .where(eq(schema.invoices.id, payment.invoiceId))
-      .limit(1);
+      const [invoice] = await tx
+        .select()
+        .from(schema.invoices)
+        .where(eq(schema.invoices.id, payment.invoiceId))
+        .for('update')
+        .limit(1);
 
-    if (!invoice || !canAccessProperty(user, invoice.propertyId)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+      if (!invoice || !canAccessProperty(user, invoice.propertyId)) {
+        throw new BillingHttpError(403, 'Access denied');
+      }
 
-    const newApprovalStatus = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-    await db
-      .update(schema.payments)
-      .set({
-        approvalStatus: newApprovalStatus,
-        recordedByUserId: user.id,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.payments.id, payment.id));
+      const newApprovalStatus = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+      const [updatedPayment] = await tx
+        .update(schema.payments)
+        .set({
+          approvalStatus: newApprovalStatus,
+          recordedByUserId: user.id,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(schema.payments.id, payment.id), eq(schema.payments.approvalStatus, 'PENDING_APPROVAL')))
+        .returning();
 
-    if (decision === 'APPROVE') {
-      const newPaid = invoice.paidAmount + payment.amount;
-      const nextStatus = deriveInvoiceStatus({
-        amount: invoice.amount,
-        paidAmount: newPaid,
-        dueDate: invoice.dueDate,
-        asOfDate: new Date().toISOString().slice(0, 10),
-      });
-      await db
-        .update(schema.invoices)
-        .set({ paidAmount: newPaid, status: nextStatus, updatedAt: new Date() })
-        .where(eq(schema.invoices.id, invoice.id));
-    }
+      if (!updatedPayment) {
+        throw new BillingHttpError(409, 'Payment was already reviewed.');
+      }
+
+      if (decision === 'APPROVE') {
+        const invPayments = await tx
+          .select()
+          .from(schema.payments)
+          .where(and(eq(schema.payments.invoiceId, invoice.id), eq(schema.payments.approvalStatus, 'APPROVED')));
+        const newPaid = computeApprovedPaidAmount(invPayments);
+        if (newPaid > invoice.amount) {
+          throw new BillingHttpError(
+            400,
+            `Approving ₹${payment.amount.toLocaleString('en-IN')} exceeds invoice remaining balance.`
+          );
+        }
+        const nextStatus = deriveInvoiceStatus({
+          amount: invoice.amount,
+          paidAmount: newPaid,
+          dueDate: invoice.dueDate,
+          asOfDate: new Date().toISOString().slice(0, 10),
+        });
+        await tx
+          .update(schema.invoices)
+          .set({ paidAmount: newPaid, status: nextStatus, updatedAt: new Date() })
+          .where(eq(schema.invoices.id, invoice.id));
+      }
+
+      return { payment: updatedPayment, newApprovalStatus };
+    });
 
     await logAudit({
       user,
       action: `UPI_PAYMENT_${decision}D`,
       entityType: 'PAYMENT',
-      entityId: payment.id,
-      metadata: { amount: payment.amount, reference: payment.reference },
+      entityId: result.payment.id,
+      metadata: { amount: result.payment.amount, reference: result.payment.reference },
     });
 
-    return res.json({ ok: true, approvalStatus: newApprovalStatus });
-  } catch (err) {
+    return res.json({ ok: true, approvalStatus: result.newApprovalStatus });
+  } catch (err: any) {
+    if (err instanceof BillingHttpError) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('POST /api/billing/payments/:id/review error:', err);
     return res.status(500).json({ error: 'Failed to review UPI payment' });
   }
@@ -388,6 +503,14 @@ billingRouter.get('/invoices/:id/receipt.pdf', requireAuth, requireRole('OWNER',
         .where(and(eq(schema.payments.invoiceId, invoice.id), eq(schema.payments.approvalStatus, 'APPROVED'))),
     ]);
 
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const reconciled = reconcileInvoiceWithPayments(invoice, invPayments, todayStr);
+    if (!canDownloadInvoiceReceipt({ paidAmount: reconciled.paidAmount, approvedCount: reconciled.approvedCount })) {
+      return res.status(400).json({
+        error: 'Receipt cannot be generated for an unpaid invoice. Record a payment first.',
+      });
+    }
+
     const org = orgRows[0];
     const prop = propRows[0];
     const tenant = tenantRows[0];
@@ -411,13 +534,13 @@ billingRouter.get('/invoices/:id/receipt.pdf', requireAuth, requireRole('OWNER',
       periodLabel: formatMonthYear(invoice.periodMonth, invoice.periodYear),
       issuedDate: formatDateIN(invoice.createdAt),
       dueDate: formatDateIN(invoice.dueDate),
-      status: invoice.status,
+      status: reconciled.status,
       tenantName: tenant?.name || 'Resident',
       tenantPhone: tenant?.phone || '',
       roomBedLabel,
       items: invoice.items,
       totalAmount: invoice.amount,
-      paidAmount: invoice.paidAmount,
+      paidAmount: reconciled.paidAmount,
       payments: invPayments.map((p) => ({
         paidAt: formatDateIN(p.paidAt),
         method: p.method,

@@ -21,7 +21,8 @@ test('status and category formatters return readable human labels', () => {
   assert.equal(formatInvoiceStatus('PAID'), 'Paid');
   assert.equal(formatInvoiceStatus('PARTIAL'), 'Partially Paid');
   assert.equal(formatInvoiceStatus('OVERDUE'), 'Overdue');
-  assert.equal(formatInvoiceStatus('PENDING'), 'Pending');
+  assert.equal(formatInvoiceStatus('UNPAID'), 'Unpaid');
+  assert.equal(formatInvoiceStatus('PENDING'), 'Unpaid');
 
   assert.equal(formatTenantStatus('ACTIVE'), 'Active');
   assert.equal(formatTenantStatus('NOTICE'), 'On Notice');

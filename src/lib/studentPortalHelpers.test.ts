@@ -17,21 +17,34 @@ import {
   validatePasswordChangeInput,
 } from './studentPortalHelpers.ts';
 
-test('deriveStudentRentSummary summarizes overdue, partial, pending, and paid statuses accurately', () => {
-  const overdue = deriveStudentRentSummary(
-    [
-      { amount: 6000, paidAmount: 0, dueDate: '2026-11-05', status: 'OVERDUE' },
-      { amount: 6000, paidAmount: 6000, dueDate: '2026-10-05', status: 'PAID' },
-    ],
-    6000
+test('deriveStudentRentSummary summarizes empty, unpaid, overdue, partial, and paid statuses accurately', () => {
+  const noInvoices = deriveStudentRentSummary([], 6000, '2026-11-16');
+  assert.equal(noInvoices.overallStatus, 'Unpaid');
+  assert.equal(noInvoices.pendingAmount, 6000);
+  assert.equal(noInvoices.amountPaid, 0);
+
+  const unpaid = deriveStudentRentSummary(
+    [{ amount: 6000, paidAmount: 0, dueDate: '2026-11-20', status: 'UNPAID' }],
+    6000,
+    '2026-11-16'
   );
-  assert.equal(overdue.overallStatus, 'Overdue');
-  assert.equal(overdue.pendingAmount, 6000);
-  assert.equal(overdue.nextDueDate, '2026-11-05');
+  assert.equal(unpaid.overallStatus, 'Unpaid');
+  assert.equal(unpaid.pendingAmount, 6000);
+  assert.equal(unpaid.nextDueDate, '2026-11-20');
+
+  const overdueByDate = deriveStudentRentSummary(
+    [{ amount: 6000, paidAmount: 0, dueDate: '2026-11-05', status: 'UNPAID' }],
+    6000,
+    '2026-11-16'
+  );
+  assert.equal(overdueByDate.overallStatus, 'Overdue');
+  assert.equal(overdueByDate.pendingAmount, 6000);
+  assert.equal(overdueByDate.nextDueDate, '2026-11-05');
 
   const partial = deriveStudentRentSummary(
     [{ amount: 6000, paidAmount: 2500, dueDate: '2026-11-18', status: 'PARTIAL' }],
-    6000
+    6000,
+    '2026-11-16'
   );
   assert.equal(partial.overallStatus, 'Partially Paid');
   assert.equal(partial.amountPaid, 2500);
@@ -39,11 +52,14 @@ test('deriveStudentRentSummary summarizes overdue, partial, pending, and paid st
 
   const paid = deriveStudentRentSummary(
     [{ amount: 6000, paidAmount: 6000, dueDate: '2026-11-05', status: 'PAID' }],
-    6000
+    6000,
+    '2026-11-16'
   );
   assert.equal(paid.overallStatus, 'Paid');
   assert.equal(paid.pendingAmount, 0);
   assert.equal(paid.nextDueDate, null);
+  assert.equal(formatStudentInvoiceStatus('UNPAID'), 'Unpaid');
+  assert.equal(formatStudentInvoiceStatus('PENDING'), 'Unpaid');
 });
 
 test('isPreviousStay and status labels distinguish active vs moved-out residents cleanly', () => {

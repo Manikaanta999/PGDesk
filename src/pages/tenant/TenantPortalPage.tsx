@@ -25,7 +25,6 @@ import {
   Plus,
   RefreshCw,
   Settings,
-  ShieldCheck,
   Sun,
   User,
   UserCheck,
@@ -37,7 +36,7 @@ import { LanguageSwitcher } from '../../components/ui/LanguageSwitcher';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
-import { apiFetch, downloadAuthorizedFile } from '../../lib/api';
+import { ApiError, apiFetch, downloadAuthorizedFile } from '../../lib/api';
 import { formatDateIN, formatIndianPhone, formatINR } from '../../lib/format';
 import {
   deriveStudentRentSummary,
@@ -95,7 +94,7 @@ const ACCOUNT_SUB_TABS: PortalTab[] = [
 ];
 
 export function TenantPortalPage() {
-  const { user, darkMode, toggleDarkMode, logout } = useAuth();
+  const { user, darkMode, toggleDarkMode, logout, refreshSession } = useAuth();
   const { tHeading } = useLanguage();
   const { showToast } = useToast();
   const navigate = useNavigate();
@@ -115,6 +114,7 @@ export function TenantPortalPage() {
 
   const [data, setData] = useState<TenantOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const [notifOpen, setNotifOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -165,6 +165,7 @@ export function TenantPortalPage() {
 
   const loadOverview = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const res = await apiFetch<TenantOverviewResponse>('/api/tenant/overview');
       setData(res);
@@ -180,11 +181,16 @@ export function TenantPortalPage() {
         setLinkReqPropertyId((prev) => prev || String(res.availableHostels![0].id));
       }
     } catch (err: any) {
-      showToast(err.message || 'Could not load student portal', 'error');
+      const msg = err?.message || 'Could not load student portal';
+      setLoadError(msg);
+      showToast(msg, 'error');
+      if (err instanceof ApiError && err.status === 401) {
+        await refreshSession();
+      }
     } finally {
       setLoading(false);
     }
-  }, [showToast]);
+  }, [refreshSession, showToast]);
 
   useEffect(() => {
     loadOverview();
@@ -295,8 +301,9 @@ export function TenantPortalPage() {
     .map((p) => p[0]?.toUpperCase() || '')
     .join('');
 
+  const todayStr = new Date().toISOString().slice(0, 10);
   const rentSummary = activeTenant
-    ? deriveStudentRentSummary(data?.invoices || [], activeTenant.monthlyRent)
+    ? deriveStudentRentSummary(data?.invoices || [], activeTenant.monthlyRent, todayStr)
     : null;
   const activeMoveOutReq = data?.moveOutRequests?.find(
     (r) => r.status === 'SUBMITTED' || r.status === 'UNDER_REVIEW'
@@ -759,13 +766,40 @@ export function TenantPortalPage() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-5 pb-24 sm:px-6 sm:py-8 sm:pb-24 lg:pb-8">
-        {loading || !data ? (
+        {loading ? (
           <div className="space-y-4">
             <div className="h-32 animate-pulse rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" />
             <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
               {[1, 2, 3, 4].map((i) => (
                 <div key={i} className="h-24 animate-pulse rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900" />
               ))}
+            </div>
+          </div>
+        ) : loadError || !data ? (
+          <div className="mx-auto max-w-lg rounded-2xl border border-red-200 bg-white p-6 text-center dark:border-red-900/50 dark:bg-slate-900">
+            <h1 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+              Unable to Open Student Dashboard
+            </h1>
+            <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
+              {loadError || 'Your session could not be verified. Please sign in again.'}
+            </p>
+            <div className="mt-5 flex flex-wrap justify-center gap-3">
+              <button
+                type="button"
+                onClick={loadOverview}
+                className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                <span>Try Again</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleSignOut}
+                className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                <span>Sign In Again</span>
+              </button>
             </div>
           </div>
         ) : activeTab === 'account' ? (
@@ -1561,19 +1595,21 @@ export function TenantPortalPage() {
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
                           <span className="font-mono font-bold tabular-nums">{formatINR(p.amount)}</span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              downloadAuthorizedFile(
-                                `/api/tenant/invoices/${p.invoiceId}/receipt.pdf`,
-                                `Receipt-${p.invoiceId}.pdf`
-                              ).catch((e) => showToast(e.message || 'Download failed', 'error'))
-                            }
-                            aria-label="Download receipt PDF"
-                            className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                          </button>
+                          {p.approvalStatus === 'APPROVED' && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                downloadAuthorizedFile(
+                                  `/api/tenant/invoices/${p.invoiceId}/receipt.pdf`,
+                                  `Receipt-${p.invoiceId}.pdf`
+                                ).catch((e) => showToast(e.message || 'Download failed', 'error'))
+                              }
+                              aria-label="Download receipt PDF"
+                              className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))

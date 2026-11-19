@@ -1,15 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  calculateAdmissionInvoice,
   calculateDepositSettlement,
   calculateGstBreakdown,
   calculateProRataRent,
+  canDownloadInvoiceReceipt,
   checkPlanBedLimit,
   checkPlanPropertyLimit,
+  computeApprovedPaidAmount,
   computeLateFee,
   deriveInvoiceStatus,
   formatFyInvoiceNumber,
   getIndianFinancialYearLabel,
+  reconcileInvoiceWithPayments,
   validateMaskedIdNumber,
 } from './billing.ts';
 import { getActiveEntitlement, isFeatureAvailable, SUBSCRIPTIONS_ENABLED } from './entitlements.ts';
@@ -103,7 +107,7 @@ test('computeLateFee respects grace days and balance due', () => {
   );
 });
 
-test('deriveInvoiceStatus resolves PAID, PARTIAL, PENDING, and OVERDUE accurately', () => {
+test('deriveInvoiceStatus resolves PAID, PARTIAL, UNPAID, and OVERDUE accurately', () => {
   assert.equal(
     deriveInvoiceStatus({ amount: 12000, paidAmount: 12000, dueDate: '2026-11-05', asOfDate: '2026-11-10' }),
     'PAID'
@@ -118,8 +122,80 @@ test('deriveInvoiceStatus resolves PAID, PARTIAL, PENDING, and OVERDUE accuratel
   );
   assert.equal(
     deriveInvoiceStatus({ amount: 12000, paidAmount: 0, dueDate: '2026-11-15', asOfDate: '2026-11-10' }),
-    'PENDING'
+    'UNPAID'
   );
+  assert.equal(
+    deriveInvoiceStatus({ amount: 12000, paidAmount: 0, dueDate: '2026-11-05', asOfDate: '2026-11-10' }),
+    'OVERDUE'
+  );
+});
+
+test('reconcileInvoiceWithPayments computes paidAmount and status strictly from APPROVED transactions', () => {
+  const unpaid = reconcileInvoiceWithPayments(
+    { amount: 6000, dueDate: '2026-11-20' },
+    [
+      { amount: 6000, approvalStatus: 'PENDING_APPROVAL' },
+      { amount: 3000, approvalStatus: 'REJECTED' },
+    ],
+    '2026-11-16'
+  );
+  assert.equal(unpaid.paidAmount, 0);
+  assert.equal(unpaid.balanceDue, 6000);
+  assert.equal(unpaid.status, 'UNPAID');
+  assert.equal(unpaid.approvedCount, 0);
+  assert.equal(canDownloadInvoiceReceipt({ paidAmount: unpaid.paidAmount, approvedCount: unpaid.approvedCount }), false);
+
+  const partial = reconcileInvoiceWithPayments(
+    { amount: 6000, dueDate: '2026-11-20' },
+    [
+      { amount: 3000, approvalStatus: 'APPROVED' },
+      { amount: 3000, approvalStatus: 'PENDING_APPROVAL' },
+    ],
+    '2026-11-16'
+  );
+  assert.equal(partial.paidAmount, 3000);
+  assert.equal(partial.balanceDue, 3000);
+  assert.equal(partial.status, 'PARTIAL');
+  assert.equal(partial.approvedCount, 1);
+  assert.equal(canDownloadInvoiceReceipt({ paidAmount: partial.paidAmount, approvedCount: partial.approvedCount }), true);
+
+  const paid = reconcileInvoiceWithPayments(
+    { amount: 6000, dueDate: '2026-11-10' },
+    [
+      { amount: 3000, approvalStatus: 'APPROVED' },
+      { amount: 3000, approvalStatus: 'APPROVED' },
+    ],
+    '2026-11-16'
+  );
+  assert.equal(paid.paidAmount, 6000);
+  assert.equal(paid.balanceDue, 0);
+  assert.equal(paid.status, 'PAID');
+  assert.equal(computeApprovedPaidAmount([{ amount: 2000, approvalStatus: 'APPROVED' }]), 2000);
+});
+
+test('calculateAdmissionInvoice creates UNPAID joining invoice with pro-rata and due date', () => {
+  const fullMonth = calculateAdmissionInvoice({
+    monthlyRent: 6000,
+    joinDate: '2026-11-01',
+    dueDaysAfterInvoice: 5,
+    asOfDate: '2026-11-01',
+  });
+  assert.equal(fullMonth.amount, 6000);
+  assert.equal(fullMonth.isProRata, false);
+  assert.equal(fullMonth.dueDate, '2026-11-06');
+  assert.equal(fullMonth.status, 'UNPAID');
+
+  const midMonth = calculateAdmissionInvoice({
+    monthlyRent: 6000,
+    joinDate: '2026-11-16',
+    dueDaysAfterInvoice: 5,
+    asOfDate: '2026-11-16',
+  });
+  assert.equal(midMonth.amount, 3000);
+  assert.equal(midMonth.isProRata, true);
+  assert.equal(midMonth.billableDays, 15);
+  assert.equal(midMonth.dueDate, '2026-11-21');
+  assert.equal(midMonth.status, 'UNPAID');
 });
 
 test('calculateDepositSettlement computes refundable and payable amounts', () => {
@@ -239,7 +315,7 @@ test('security helpers: demo mode gating, OTP token hash, and cron secret check'
   assert.equal(verifyCronSecret(undefined, 'super-secret-cron-key'), false);
 });
 
-test('createTenantSchema allows optional emergency contact & KYC and defaults generateJoiningInvoice to false', () => {
+test('createTenantSchema defaults generateJoiningInvoice to true, paymentOption to NO_PAYMENT, and validates PAYMENT_RECEIVED', () => {
   const minimal = createTenantSchema.safeParse({
     name: 'Kiran Rao',
     phone: '9876501234',
@@ -251,11 +327,42 @@ test('createTenantSchema allows optional emergency contact & KYC and defaults ge
   });
   assert.equal(minimal.success, true);
   if (minimal.success) {
-    assert.equal(minimal.data.generateJoiningInvoice, false);
+    assert.equal(minimal.data.generateJoiningInvoice, true);
+    assert.equal(minimal.data.paymentOption, 'NO_PAYMENT');
     assert.equal(minimal.data.emergencyContactName, '');
     assert.equal(minimal.data.emergencyContactPhone, '');
     assert.equal(minimal.data.idNumberMasked, '');
   }
+
+  const missingPaidAmount = createTenantSchema.safeParse({
+    name: 'Kiran Rao',
+    phone: '9876501234',
+    propertyId: 1,
+    bedId: 2,
+    joinDate: '2026-11-14',
+    monthlyRent: 6000,
+    securityDeposit: 12000,
+    paymentOption: 'PAYMENT_RECEIVED',
+    initialPaymentAmount: 0,
+    initialPaymentMethod: 'UPI',
+    initialPaymentDate: '2026-11-14',
+  });
+  assert.equal(missingPaidAmount.success, false);
+
+  const validPartialAdmission = createTenantSchema.safeParse({
+    name: 'Kiran Rao',
+    phone: '9876501234',
+    propertyId: 1,
+    bedId: 2,
+    joinDate: '2026-11-14',
+    monthlyRent: 6000,
+    securityDeposit: 12000,
+    paymentOption: 'PAYMENT_RECEIVED',
+    initialPaymentAmount: 3000,
+    initialPaymentMethod: 'CASH',
+    initialPaymentDate: '2026-11-14',
+  });
+  assert.equal(validPartialAdmission.success, true);
 
   const badAadhaar = createTenantSchema.safeParse({
     name: 'Kiran Rao',

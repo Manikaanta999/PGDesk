@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { and, count, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
+import { reconcileInvoiceWithPayments } from '../../lib/billing.ts';
 import { getActiveEntitlement, SUBSCRIPTIONS_ENABLED } from '../../lib/entitlements.ts';
 import { formatMonthYear } from '../../lib/format.ts';
 import { hashPassword } from '../../lib/security.ts';
@@ -419,7 +420,7 @@ operationsRouter.get('/expenses', requireAuth, requireRole('OWNER', 'MANAGER'), 
     const targetIds = propertyId && allowedIds.includes(propertyId) ? [propertyId] : allowedIds;
     if (targetIds.length === 0) return res.json({ expenses: [], pnl: [] });
 
-    const [expenseRows, invoiceRows] = await Promise.all([
+    const [expenseRows, invoiceRows, approvedPaymentRows] = await Promise.all([
       db
         .select()
         .from(schema.expenses)
@@ -439,11 +440,34 @@ operationsRouter.get('/expenses', requireAuth, requireRole('OWNER', 'MANAGER'), 
             inArray(schema.invoices.propertyId, targetIds)
           )
         ),
+      db
+        .select()
+        .from(schema.payments)
+        .where(
+          and(
+            eq(schema.payments.organizationId, user.organizationId),
+            eq(schema.payments.approvalStatus, 'APPROVED')
+          )
+        ),
     ]);
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const paymentsByInvoice = new Map<number, typeof approvedPaymentRows>();
+    for (const p of approvedPaymentRows) {
+      const arr = paymentsByInvoice.get(p.invoiceId) ?? [];
+      arr.push(p);
+      paymentsByInvoice.set(p.invoiceId, arr);
+    }
+
+    const reconciledInvoices = invoiceRows.map((inv) => ({
+      ...inv,
+      reconciledPaidAmount: reconcileInvoiceWithPayments(inv, paymentsByInvoice.get(inv.id) ?? [], todayStr)
+        .paidAmount,
+    }));
 
     const propMap = new Map(props.map((p) => [p.id, p]));
     const monthSet = new Set<string>();
-    for (const inv of invoiceRows) {
+    for (const inv of reconciledInvoices) {
       monthSet.add(`${inv.periodYear}-${String(inv.periodMonth).padStart(2, '0')}`);
     }
     for (const exp of expenseRows) {
@@ -453,9 +477,9 @@ operationsRouter.get('/expenses', requireAuth, requireRole('OWNER', 'MANAGER'), 
     const sortedMonths = Array.from(monthSet).sort().reverse().slice(0, 12);
     const pnl = sortedMonths.map((ym) => {
       const [y, m] = ym.split('-').map(Number);
-      const rev = invoiceRows
+      const rev = reconciledInvoices
         .filter((i) => i.periodYear === y && i.periodMonth === m)
-        .reduce((s, i) => s + i.paidAmount, 0);
+        .reduce((s, i) => s + i.reconciledPaidAmount, 0);
       const exp = expenseRows
         .filter((e) => e.expenseDate.startsWith(ym))
         .reduce((s, e) => s + e.amount, 0);
@@ -530,7 +554,7 @@ operationsRouter.get('/reports/pnl.csv', requireAuth, requireRole('OWNER', 'MANA
       return res.send('Month,Collected Rent (INR),Total Expenses (INR),Net Operating Profit (INR)');
     }
 
-    const [expenseRows, invoiceRows] = await Promise.all([
+    const [expenseRows, invoiceRows, approvedPaymentRows] = await Promise.all([
       db
         .select()
         .from(schema.expenses)
@@ -539,18 +563,36 @@ operationsRouter.get('/reports/pnl.csv', requireAuth, requireRole('OWNER', 'MANA
         .select()
         .from(schema.invoices)
         .where(and(eq(schema.invoices.organizationId, user.organizationId), inArray(schema.invoices.propertyId, targetIds))),
+      db
+        .select()
+        .from(schema.payments)
+        .where(and(eq(schema.payments.organizationId, user.organizationId), eq(schema.payments.approvalStatus, 'APPROVED'))),
     ]);
 
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const paymentsByInvoice = new Map<number, typeof approvedPaymentRows>();
+    for (const p of approvedPaymentRows) {
+      const arr = paymentsByInvoice.get(p.invoiceId) ?? [];
+      arr.push(p);
+      paymentsByInvoice.set(p.invoiceId, arr);
+    }
+
+    const reconciledInvoices = invoiceRows.map((inv) => ({
+      ...inv,
+      reconciledPaidAmount: reconcileInvoiceWithPayments(inv, paymentsByInvoice.get(inv.id) ?? [], todayStr)
+        .paidAmount,
+    }));
+
     const monthSet = new Set<string>();
-    invoiceRows.forEach((i) => monthSet.add(`${i.periodYear}-${String(i.periodMonth).padStart(2, '0')}`));
+    reconciledInvoices.forEach((i) => monthSet.add(`${i.periodYear}-${String(i.periodMonth).padStart(2, '0')}`));
     expenseRows.forEach((e) => monthSet.add(e.expenseDate.slice(0, 7)));
 
     const lines = ['Month,Collected Rent (INR),Total Expenses (INR),Net Operating Profit (INR)'];
     for (const ym of Array.from(monthSet).sort()) {
       const [y, m] = ym.split('-').map(Number);
-      const rev = invoiceRows
+      const rev = reconciledInvoices
         .filter((i) => i.periodYear === y && i.periodMonth === m)
-        .reduce((s, i) => s + i.paidAmount, 0);
+        .reduce((s, i) => s + i.reconciledPaidAmount, 0);
       const exp = expenseRows
         .filter((e) => e.expenseDate.startsWith(ym))
         .reduce((s, e) => s + e.amount, 0);

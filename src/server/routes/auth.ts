@@ -1,12 +1,15 @@
 import { Request, Response, Router } from 'express';
-import { and, eq, gt, isNull, or } from 'drizzle-orm';
+import { and, eq, isNull, or } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import { ensureSeeded } from '../../db/seed.ts';
 import {
-  isValidOwnerTokenFormat,
-  normalizeTokenCode,
-  resolveOwnerTokenStatus,
-} from '../../lib/platformAuth.ts';
+  FORGOT_PASSWORD_UNAVAILABLE_MESSAGE,
+  getAuthTestingPolicy,
+  isEmailVerificationEnabled,
+  isPasswordResetEmailEnabled,
+  isSmsOtpEnabled,
+} from '../../lib/authPolicy.ts';
+import { AppUserRole, normalizeLoginIdentifier, normalizeUserRole } from '../../lib/authRoles.ts';
 import {
   checkRateLimit,
   generateSixDigitOtp,
@@ -20,9 +23,8 @@ import {
   forgotPasswordSchema,
   loginSchema,
   registerSchema,
-  resendVerificationSchema,
   resetPasswordSchema,
-  verifyEmailSchema,
+  verifyOtpSchema,
 } from '../../lib/validation.ts';
 import {
   getCookieOptions,
@@ -30,7 +32,6 @@ import {
   resolveAuthUser,
   SESSION_COOKIE_NAME,
 } from '../../middleware/auth.ts';
-import { ensurePlatformOrg } from '../adminBootstrap.ts';
 import { logAudit } from '../audit.ts';
 
 function toSlug(input: string): string {
@@ -43,12 +44,16 @@ function toSlug(input: string): string {
 
 export const authRouter = Router();
 
-function normalizePhone10(raw: string | null | undefined): string {
-  const digits = String(raw || '').replace(/\D/g, '');
+function normalizePhone10(raw: string): string {
+  const digits = raw.replace(/\D/g, '');
   if (digits.length === 12 && digits.startsWith('91')) {
     return digits.slice(2);
   }
   return digits.slice(-10);
+}
+
+async function ensureAppReady(): Promise<void> {
+  await ensureSeeded();
 }
 
 function serializeSessionUser(u: {
@@ -58,7 +63,7 @@ function serializeSessionUser(u: {
   email: string;
   phone: string | null;
   photoUrl?: string | null;
-  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+  role: AppUserRole;
   assignedPropertyIds: number[];
 }) {
   return {
@@ -74,36 +79,46 @@ function serializeSessionUser(u: {
 }
 
 authRouter.get('/config', (_req, res) => {
-  return res.json({ demoModeEnabled: isDemoModeEnabled() });
+  return res.json({
+    demoModeEnabled: isDemoModeEnabled(),
+    authPolicy: getAuthTestingPolicy(),
+  });
 });
 
 authRouter.get('/me', async (req, res) => {
   try {
-    await ensureSeeded();
+    await ensureAppReady();
     const demoModeEnabled = isDemoModeEnabled();
+    const authPolicy = getAuthTestingPolicy();
     const resolved = await resolveAuthUser(req);
     const user = resolved?.user ?? null;
     if (!user) {
-      return res.json({ user: null, demoModeEnabled });
-    }
-    if (user.role === 'ADMIN') {
-      return res.json({ user: serializeSessionUser(user), organization: null, demoModeEnabled });
+      return res.json({ user: null, demoModeEnabled, authPolicy });
     }
     const [org] = await db
       .select()
       .from(schema.organizations)
       .where(eq(schema.organizations.id, user.organizationId))
       .limit(1);
-    return res.json({ user: serializeSessionUser(user), organization: org || null, demoModeEnabled });
+    if (!org) {
+      console.error(`GET /api/auth/me: missing organization ${user.organizationId} for user ${user.id}`);
+      return res.status(500).json({
+        code: 'PROFILE_LOAD_FAILED',
+        error: 'Login successful, but your account profile could not be loaded. Please contact support.',
+        demoModeEnabled,
+        authPolicy,
+      });
+    }
+    return res.json({ user: serializeSessionUser(user), organization: org, demoModeEnabled, authPolicy });
   } catch (err) {
     console.error('GET /api/auth/me error:', err);
-    return res.status(500).json({ error: 'Failed to resolve session' });
+    return res.status(500).json({ code: 'PROFILE_LOAD_FAILED', error: 'Failed to resolve session' });
   }
 });
 
 authRouter.post('/register', async (req, res) => {
   try {
-    await ensureSeeded();
+    await ensureAppReady();
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`register:${ip}`, 15, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many signup attempts. Please try again shortly.' });
@@ -115,10 +130,8 @@ authRouter.post('/register', async (req, res) => {
     }
 
     const emailLower = parsed.data.email.trim().toLowerCase();
-    const rawPhone10 = normalizePhone10(parsed.data.phone);
-    const phone10 = rawPhone10.length === 10 ? rawPhone10 : null;
+    const phone10 = normalizePhone10(parsed.data.phone);
     const passwordHash = hashPassword(parsed.data.password);
-    const role: 'OWNER' | 'TENANT' = parsed.data.accountType;
 
     const existing = await db
       .select({ id: schema.users.id })
@@ -132,176 +145,130 @@ authRouter.post('/register', async (req, res) => {
       });
     }
 
-    const verificationCode = generateSixDigitOtp();
-    const verificationExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    let orgRecord: typeof schema.organizations.$inferSelect | null = null;
+    const role: 'OWNER' | 'TENANT' = parsed.data.accountType;
+    let matchedTenants: Array<typeof schema.tenants.$inferSelect> = [];
 
     if (role === 'OWNER') {
-      const normalizedToken = normalizeTokenCode(parsed.data.ownerRegistrationToken);
-      if (!isValidOwnerTokenFormat(normalizedToken)) {
-        return res.status(400).json({
-          error: 'Invalid Owner Registration Token format. Expected PGDESKOWNER-XXXX-XXXX-XXXX.',
-        });
-      }
+      const orgName = parsed.data.organizationName.trim();
+      const baseSlug = toSlug(orgName) || 'pg-group';
+      const uniqueSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
+      const upiHandle = `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`;
 
-      const tokenHash = hashToken(normalizedToken);
-      const txResult = await db.transaction(async (tx) => {
-        // Atomic single-use redemption: only UNUSED and non-expired tokens can be redeemed once
-        const [redeemedToken] = await tx
-          .update(schema.ownerRegistrationTokens)
-          .set({
-            status: 'USED',
-            usedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(schema.ownerRegistrationTokens.tokenHash, tokenHash),
-              eq(schema.ownerRegistrationTokens.status, 'UNUSED'),
-              gt(schema.ownerRegistrationTokens.expiresAt, new Date())
-            )
+      const [createdOrg] = await db
+        .insert(schema.organizations)
+        .values({
+          name: orgName,
+          slug: uniqueSlug,
+          upiId: upiHandle,
+          upiPayeeName: orgName,
+          planTier: 'STARTER',
+          phone: `+91 ${phone10.slice(0, 5)} ${phone10.slice(5)}`,
+          email: emailLower,
+          address: 'India',
+        })
+        .returning();
+      orgRecord = createdOrg;
+    } else {
+      matchedTenants = await db
+        .select()
+        .from(schema.tenants)
+        .where(
+          and(
+            isNull(schema.tenants.deletedAt),
+            or(eq(schema.tenants.email, emailLower), eq(schema.tenants.phone, phone10))
           )
-          .returning();
+        )
+        .limit(1);
 
-        if (!redeemedToken) {
-          const [matched] = await tx
-            .select()
-            .from(schema.ownerRegistrationTokens)
-            .where(eq(schema.ownerRegistrationTokens.tokenHash, tokenHash))
-            .limit(1);
-          if (!matched) {
-            return { errorStatus: 403, errorMessage: 'Invalid Owner Registration Token.' } as const;
-          }
-          const effectiveStatus = resolveOwnerTokenStatus(matched);
-          if (effectiveStatus === 'USED') {
-            return { errorStatus: 403, errorMessage: 'This Owner Registration Token has already been used.' } as const;
-          }
-          if (effectiveStatus === 'REVOKED') {
-            return { errorStatus: 403, errorMessage: 'This Owner Registration Token has been revoked.' } as const;
-          }
-          return { errorStatus: 403, errorMessage: 'This Owner Registration Token has expired.' } as const;
-        }
-
-        const orgName = parsed.data.organizationName.trim();
-        const baseSlug = toSlug(orgName) || 'pg-group';
-        const uniqueSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
-        const upiHandle = `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`;
-
-        const [createdOrg] = await tx
-          .insert(schema.organizations)
-          .values({
-            name: orgName,
-            slug: uniqueSlug,
-            upiId: upiHandle,
-            upiPayeeName: orgName,
-            planTier: 'STARTER',
-            phone: phone10 ? `+91 ${phone10.slice(0, 5)} ${phone10.slice(5)}` : '',
-            email: emailLower,
-            address: 'India',
-          })
-          .returning();
-
-        const [createdUser] = await tx
-          .insert(schema.users)
-          .values({
-            organizationId: createdOrg.id,
-            name: parsed.data.name.trim(),
-            email: emailLower,
-            phone: phone10,
-            passwordHash,
-            role: 'OWNER',
-            assignedPropertyIds: [],
-            isActive: true,
-            emailVerified: false,
-            phoneVerified: false,
-            emailVerificationTokenHash: hashToken(verificationCode),
-            emailVerificationExpiresAt: verificationExpiresAt,
-          })
-          .returning();
-
-        await tx
-          .update(schema.ownerRegistrationTokens)
-          .set({
-            usedByUserId: createdUser.id,
-            usedByOrganizationId: createdOrg.id,
-          })
-          .where(eq(schema.ownerRegistrationTokens.id, redeemedToken.id));
-
-        await tx.insert(schema.auditLogs).values([
-          {
-            organizationId: createdOrg.id,
-            actorUserId: createdUser.id,
-            actorName: createdUser.name,
-            actorRole: 'OWNER',
-            action: 'OWNER_TOKEN_REDEEMED',
-            entityType: 'OWNER_TOKEN',
-            entityId: String(redeemedToken.id),
-            metadata: { tokenLast4: redeemedToken.tokenLast4 },
-          },
-          {
-            organizationId: createdOrg.id,
-            actorUserId: createdUser.id,
-            actorName: createdUser.name,
-            actorRole: 'OWNER',
-            action: 'OWNER_REGISTERED',
-            entityType: 'ORGANIZATION',
-            entityId: String(createdOrg.id),
-            metadata: { organizationName: createdOrg.name },
-          },
-        ]);
-
-        return { ok: true, createdUser, createdOrg } as const;
-      });
-
-      if ('errorStatus' in txResult && txResult.errorStatus) {
-        return res.status(txResult.errorStatus).json({ error: txResult.errorMessage });
+      if (matchedTenants[0]) {
+        const [matchedOrg] = await db
+          .select()
+          .from(schema.organizations)
+          .where(eq(schema.organizations.id, matchedTenants[0].organizationId))
+          .limit(1);
+        orgRecord = matchedOrg || null;
       }
 
-      if (process.env.NODE_ENV !== 'production') {
-        console.info(`[PGDesk Email Verification] Owner verification code for ${emailLower}: ${verificationCode}`);
+      if (!orgRecord) {
+        const [defaultOrg] = await db.select().from(schema.organizations).limit(1);
+        orgRecord = defaultOrg || null;
       }
-
-      return res.status(202).json({
-        requiresEmailVerification: true,
-        email: emailLower,
-        message: 'Owner account created. Enter the 6-digit verification code sent to your email address.',
-      });
     }
 
-    // Student / Tenant self-registration: assign to platform org with zero auto-linked tenant records
-    const platformOrg = await ensurePlatformOrg();
-    const [createdStudent] = await db
+    if (!orgRecord) {
+      return res.status(400).json({ error: 'No active PG organization found to join. Ask your PG owner to onboard you first.' });
+    }
+
+    // During development/testing without email/SMS providers, email confirmation and SMS OTP are disabled
+    const requiresOtp =
+      (isSmsOtpEnabled() || isEmailVerificationEnabled()) && role === 'TENANT' && matchedTenants.length > 0;
+    const otp = requiresOtp ? generateSixDigitOtp() : null;
+
+    const [createdUser] = await db
       .insert(schema.users)
       .values({
-        organizationId: platformOrg.id,
+        organizationId: orgRecord.id,
         name: parsed.data.name.trim(),
         email: emailLower,
         phone: phone10,
         passwordHash,
-        role: 'TENANT',
-        assignedPropertyIds: [],
+        role,
+        assignedPropertyIds: matchedTenants[0] ? [matchedTenants[0].propertyId] : [],
         isActive: true,
-        emailVerified: false,
-        phoneVerified: false,
-        emailVerificationTokenHash: hashToken(verificationCode),
-        emailVerificationExpiresAt: verificationExpiresAt,
+        emailVerified: !requiresOtp,
+        lastLoginAt: requiresOtp ? null : new Date(),
+        otpCodeHash: otp ? hashToken(otp) : null,
+        otpExpiresAt: otp ? new Date(Date.now() + 10 * 60 * 1000) : null,
       })
       .returning();
 
-    await logAudit({
-      user: serializeSessionUser(createdStudent),
-      action: 'STUDENT_ACCOUNT_REGISTERED',
-      entityType: 'USER',
-      entityId: createdStudent.id,
-      metadata: { email: emailLower },
-    });
-
-    if (process.env.NODE_ENV !== 'production') {
-      console.info(`[PGDesk Email Verification] Student verification code for ${emailLower}: ${verificationCode}`);
+    if (requiresOtp && otp) {
+      return res.status(202).json({
+        requiresOtp: true,
+        email: emailLower,
+        message: 'Verification code required to confirm your resident profile.',
+      });
     }
 
-    return res.status(202).json({
-      requiresEmailVerification: true,
-      email: emailLower,
-      message: 'Account created. Enter the 6-digit verification code sent to your email address.',
+    if (role === 'TENANT' && matchedTenants[0] && !matchedTenants[0].userId) {
+      await db
+        .update(schema.tenants)
+        .set({ userId: createdUser.id, updatedAt: new Date() })
+        .where(
+          and(
+            eq(schema.tenants.id, matchedTenants[0].id),
+            eq(schema.tenants.organizationId, orgRecord.id),
+            isNull(schema.tenants.userId)
+          )
+        );
+    }
+
+    if (role === 'OWNER') {
+      await logAudit({
+        user: serializeSessionUser({ ...createdUser, role }),
+        action: 'OWNER_REGISTERED',
+        entityType: 'ORGANIZATION',
+        entityId: orgRecord.id,
+        metadata: { organizationName: orgRecord.name },
+      });
+    }
+
+    const { token, cookieOnly } = await issueUserSession(req, res, {
+      id: createdUser.id,
+      organizationId: createdUser.organizationId,
+      role,
+      tokenVersion: createdUser.tokenVersion ?? 1,
+    });
+
+    return res.status(201).json({
+      token: cookieOnly ? undefined : token,
+      cookieOnly,
+      user: serializeSessionUser({
+        ...createdUser,
+        role,
+      }),
+      organization: orgRecord,
     });
   } catch (err) {
     console.error('POST /api/auth/register error:', err);
@@ -309,16 +276,19 @@ authRouter.post('/register', async (req, res) => {
   }
 });
 
-authRouter.post('/verify-email', async (req, res) => {
+authRouter.post('/verify-otp', async (req, res) => {
   try {
+    if (!isSmsOtpEnabled() && !isEmailVerificationEnabled()) {
+      return res.status(410).json({ error: 'OTP verification is disabled during testing.' });
+    }
     const ip = req.ip || 'unknown';
-    if (!checkRateLimit(`verify-email:${ip}`, 20, 10 * 60 * 1000)) {
-      return res.status(429).json({ error: 'Too many verification attempts. Please wait a few minutes.' });
+    if (!checkRateLimit(`verify-otp:${ip}`, 15, 10 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many OTP attempts. Please wait a few minutes.' });
     }
 
-    const parsed = verifyEmailSchema.safeParse(req.body);
+    const parsed = verifyOtpSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid verification code' });
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid OTP request' });
     }
 
     const emailLower = parsed.data.email.trim().toLowerCase();
@@ -328,31 +298,44 @@ authRouter.post('/verify-email', async (req, res) => {
       .where(eq(schema.users.email, emailLower))
       .limit(1);
 
-    if (!user || !user.isActive || !user.emailVerificationTokenHash || !user.emailVerificationExpiresAt) {
-      return res.status(400).json({ error: 'Invalid or expired email verification code' });
+    if (!user || !user.otpCodeHash || !user.otpExpiresAt) {
+      return res.status(400).json({ error: 'Invalid or expired verification code' });
     }
-    if (
-      user.emailVerificationExpiresAt.getTime() < Date.now() ||
-      !verifyTokenHash(parsed.data.code, user.emailVerificationTokenHash)
-    ) {
-      return res.status(400).json({ error: 'Invalid or expired email verification code' });
+    if (user.otpExpiresAt.getTime() < Date.now() || !verifyTokenHash(parsed.data.otp, user.otpCodeHash)) {
+      return res.status(400).json({ error: 'Invalid or expired 6-digit verification code' });
     }
 
     const [verifiedUser] = await db
       .update(schema.users)
       .set({
         emailVerified: true,
-        emailVerificationTokenHash: null,
-        emailVerificationExpiresAt: null,
+        otpCodeHash: null,
+        otpExpiresAt: null,
         lastLoginAt: new Date(),
         updatedAt: new Date(),
       })
       .where(eq(schema.users.id, user.id))
       .returning();
 
+    const phone10 = normalizePhone10(verifiedUser.phone || '');
+    await db
+      .update(schema.tenants)
+      .set({ userId: verifiedUser.id, updatedAt: new Date() })
+      .where(
+        and(
+          eq(schema.tenants.organizationId, verifiedUser.organizationId),
+          isNull(schema.tenants.deletedAt),
+          phone10.length === 10
+            ? or(eq(schema.tenants.email, verifiedUser.email), eq(schema.tenants.phone, phone10))
+            : eq(schema.tenants.email, verifiedUser.email)
+        )
+      );
+
+    const verifiedRole: AppUserRole = normalizeUserRole(verifiedUser.role) ?? 'TENANT';
+
     await logAudit({
-      user: serializeSessionUser(verifiedUser),
-      action: 'EMAIL_VERIFIED',
+      user: serializeSessionUser({ ...verifiedUser, role: verifiedRole }),
+      action: 'TENANT_OTP_VERIFIED',
       entityType: 'USER',
       entityId: verifiedUser.id,
       metadata: { email: verifiedUser.email },
@@ -364,84 +347,58 @@ authRouter.post('/verify-email', async (req, res) => {
       .where(eq(schema.organizations.id, verifiedUser.organizationId))
       .limit(1);
 
-    const { token, cookieOnly } = await issueUserSession(req, res, verifiedUser);
+    const { token, cookieOnly } = await issueUserSession(req, res, {
+      id: verifiedUser.id,
+      organizationId: verifiedUser.organizationId,
+      role: verifiedRole,
+      tokenVersion: verifiedUser.tokenVersion ?? 1,
+    });
 
     return res.json({
       token: cookieOnly ? undefined : token,
       cookieOnly,
-      user: serializeSessionUser(verifiedUser),
-      organization: verifiedUser.role === 'ADMIN' ? null : org || null,
+      user: serializeSessionUser({ ...verifiedUser, role: verifiedRole }),
+      organization: org || null,
     });
   } catch (err) {
-    console.error('POST /api/auth/verify-email error:', err);
-    return res.status(500).json({ error: 'Email verification failed' });
-  }
-});
-
-authRouter.post('/resend-verification', async (req, res) => {
-  try {
-    const ip = req.ip || 'unknown';
-    if (!checkRateLimit(`resend-verify:${ip}`, 10, 15 * 60 * 1000)) {
-      return res.status(429).json({ error: 'Too many verification requests. Please wait a few minutes.' });
-    }
-
-    const parsed = resendVerificationSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Enter a valid email address' });
-    }
-
-    const emailLower = parsed.data.email.trim().toLowerCase();
-    const [user] = await db
-      .select()
-      .from(schema.users)
-      .where(eq(schema.users.email, emailLower))
-      .limit(1);
-
-    if (user && user.isActive && !user.emailVerified) {
-      const code = generateSixDigitOtp();
-      await db
-        .update(schema.users)
-        .set({
-          emailVerificationTokenHash: hashToken(code),
-          emailVerificationExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
-          updatedAt: new Date(),
-        })
-        .where(eq(schema.users.id, user.id));
-
-      if (process.env.NODE_ENV !== 'production') {
-        console.info(`[PGDesk Email Verification] Resent code for ${emailLower}: ${code}`);
-      }
-    }
-
-    return res.json({
-      ok: true,
-      message: 'If your account is awaiting verification, a new 6-digit code has been sent to your email.',
-    });
-  } catch (err) {
-    console.error('POST /api/auth/resend-verification error:', err);
-    return res.status(500).json({ error: 'Failed to resend verification email' });
+    console.error('POST /api/auth/verify-otp error:', err);
+    return res.status(500).json({ error: 'OTP verification failed' });
   }
 });
 
 authRouter.post('/forgot-password', async (req, res) => {
   try {
-    await ensureSeeded();
+    await ensureAppReady();
+    if (!isPasswordResetEmailEnabled()) {
+      return res.status(503).json({
+        ok: false,
+        unavailable: true,
+        error: FORGOT_PASSWORD_UNAVAILABLE_MESSAGE,
+      });
+    }
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`forgot-pwd:${ip}`, 10, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many reset requests. Please try again later.' });
     }
 
-    // Strict email-only recovery (no mobile number or SMS OTP)
     const parsed = forgotPasswordSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Enter a valid email address' });
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid identifier' });
     }
 
-    const emailLower = parsed.data.email.trim().toLowerCase();
+    const identifier = parsed.data.identifier.trim().toLowerCase();
+    const digitsOnly = identifier.replace(/\D/g, '');
+    const normalizedPhone =
+      digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
+
     const found = await db
       .select()
       .from(schema.users)
-      .where(eq(schema.users.email, emailLower))
+      .where(
+        normalizedPhone.length === 10
+          ? or(eq(schema.users.email, identifier), eq(schema.users.phone, normalizedPhone))
+          : eq(schema.users.email, identifier)
+      )
       .limit(1);
 
     const user = found[0];
@@ -455,15 +412,11 @@ authRouter.post('/forgot-password', async (req, res) => {
           updatedAt: new Date(),
         })
         .where(eq(schema.users.id, user.id));
-
-      if (process.env.NODE_ENV !== 'production') {
-        console.info(`[PGDesk Auth] Email password reset code issued for user #${user.id}: ${code}`);
-      }
     }
 
     return res.json({
       ok: true,
-      message: 'If an account matches that email address, a 6-digit password reset code has been sent via email.',
+      message: 'If an account matches that email or mobile number, a 6-digit reset code has been sent.',
     });
   } catch (err) {
     console.error('POST /api/auth/forgot-password error:', err);
@@ -473,6 +426,9 @@ authRouter.post('/forgot-password', async (req, res) => {
 
 authRouter.post('/reset-password', async (req, res) => {
   try {
+    if (!isPasswordResetEmailEnabled()) {
+      return res.status(503).json({ error: FORGOT_PASSWORD_UNAVAILABLE_MESSAGE });
+    }
     const ip = req.ip || 'unknown';
     if (!checkRateLimit(`reset-pwd:${ip}`, 15, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many reset attempts. Please try again shortly.' });
@@ -483,11 +439,19 @@ authRouter.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid reset request' });
     }
 
-    const emailLower = parsed.data.email.trim().toLowerCase();
+    const identifier = parsed.data.identifier.trim().toLowerCase();
+    const digitsOnly = identifier.replace(/\D/g, '');
+    const normalizedPhone =
+      digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
+
     const found = await db
       .select()
       .from(schema.users)
-      .where(eq(schema.users.email, emailLower))
+      .where(
+        normalizedPhone.length === 10
+          ? or(eq(schema.users.email, identifier), eq(schema.users.phone, normalizedPhone))
+          : eq(schema.users.email, identifier)
+      )
       .limit(1);
 
     const user = found[0];
@@ -499,7 +463,7 @@ authRouter.post('/reset-password', async (req, res) => {
       user.resetTokenExpiresAt.getTime() < Date.now() ||
       !verifyTokenHash(parsed.data.code, user.resetTokenHash)
     ) {
-      return res.status(400).json({ error: 'Invalid or expired email reset code' });
+      return res.status(400).json({ error: 'Invalid or expired reset code' });
     }
 
     const nextVersion = (user.tokenVersion ?? 1) + 1;
@@ -520,13 +484,16 @@ authRouter.post('/reset-password', async (req, res) => {
       .set({ revokedAt: new Date() })
       .where(and(eq(schema.userSessions.userId, user.id), isNull(schema.userSessions.revokedAt)));
 
-    await logAudit({
-      user: serializeSessionUser(user),
-      action: 'PASSWORD_RESET',
-      entityType: 'USER',
-      entityId: user.id,
-      metadata: { email: user.email, channel: 'EMAIL' },
-    });
+    const resetRole = normalizeUserRole(user.role);
+    if (resetRole) {
+      await logAudit({
+        user: serializeSessionUser({ ...user, role: resetRole }),
+        action: 'PASSWORD_RESET',
+        entityType: 'USER',
+        entityId: user.id,
+        metadata: { email: user.email },
+      });
+    }
 
     return res.json({
       ok: true,
@@ -540,110 +507,180 @@ authRouter.post('/reset-password', async (req, res) => {
 
 authRouter.post('/login', async (req, res) => {
   try {
-    await ensureSeeded();
+    await ensureAppReady();
     const ip = req.ip || 'unknown';
-    if (!checkRateLimit(`login:${ip}`, 25, 10 * 60 * 1000)) {
-      return res.status(429).json({ error: 'Too many login attempts. Please wait a few minutes.' });
-    }
 
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid credentials format' });
+      return res.status(400).json({
+        code: 'INVALID_INPUT',
+        error: parsed.error.issues[0]?.message || 'Invalid credentials format',
+      });
     }
 
-    const identifier = parsed.data.identifier.trim().toLowerCase();
-    const digitsOnly = identifier.replace(/\D/g, '');
-    const normalizedPhone =
-      digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
+    const { identifier, normalizedPhone } = normalizeLoginIdentifier(parsed.data.identifier);
+    if (!checkRateLimit(`login:${ip}:${identifier}`, 25, 10 * 60 * 1000) || !checkRateLimit(`login-ip:${ip}`, 150, 10 * 60 * 1000)) {
+      return res.status(429).json({
+        code: 'RATE_LIMITED',
+        error: 'Too many login attempts. Please wait a few minutes.',
+      });
+    }
 
-    const found = await db
-      .select({
-        id: schema.users.id,
-        organizationId: schema.users.organizationId,
-        name: schema.users.name,
-        email: schema.users.email,
-        phone: schema.users.phone,
-        photoUrl: schema.users.photoUrl,
-        passwordHash: schema.users.passwordHash,
-        role: schema.users.role,
-        assignedPropertyIds: schema.users.assignedPropertyIds,
-        isActive: schema.users.isActive,
-        emailVerified: schema.users.emailVerified,
-      })
+    const candidates = await db
+      .select()
       .from(schema.users)
       .where(
         normalizedPhone.length === 10
           ? or(eq(schema.users.email, identifier), eq(schema.users.phone, normalizedPhone))
           : eq(schema.users.email, identifier)
-      )
-      .limit(1);
+      );
 
-    const user = found[0];
-    if (!user || !user.isActive || !verifyPassword(parsed.data.password, user.passwordHash)) {
-      return res.status(401).json({ error: 'Invalid email/mobile number or password' });
-    }
-
-    if (user.role !== 'ADMIN' && user.emailVerified === false) {
-      return res.status(403).json({
-        error: 'Please verify your email address before signing in.',
-        requiresEmailVerification: true,
-        email: user.email,
+    if (candidates.length === 0) {
+      return res.status(401).json({
+        code: 'INVALID_CREDENTIALS',
+        error: 'Invalid email/mobile number or password',
       });
     }
 
+    // Prioritize exact email match before phone matches, and active accounts before inactive ones
+    const sortedCandidates = [...candidates].sort((a, b) => {
+      const aExactEmail = a.email.toLowerCase() === identifier ? 0 : 1;
+      const bExactEmail = b.email.toLowerCase() === identifier ? 0 : 1;
+      if (aExactEmail !== bExactEmail) return aExactEmail - bExactEmail;
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+      return a.id - b.id;
+    });
+
+    const passwordMatchedUser = sortedCandidates.find((u) => verifyPassword(parsed.data.password, u.passwordHash));
+
+    if (!passwordMatchedUser) {
+      const primaryCandidate = sortedCandidates[0];
+      if (sortedCandidates.every((u) => !u.isActive)) {
+        return res.status(403).json({
+          code: 'ACCOUNT_DISABLED',
+          error: 'This account has been deactivated. Please contact your administrator.',
+        });
+      }
+      if (primaryCandidate && !primaryCandidate.passwordHash && sortedCandidates.every((u) => !u.passwordHash)) {
+        return res.status(403).json({
+          code: 'PASSWORD_NOT_SET',
+          error:
+            'No password is set on this account yet. Sign in with Google or ask your administrator to set a temporary password.',
+        });
+      }
+      return res.status(401).json({
+        code: 'INVALID_CREDENTIALS',
+        error: 'Invalid email/mobile number or password',
+      });
+    }
+
+    if (
+      passwordMatchedUser.role !== 'OWNER' &&
+      passwordMatchedUser.role !== 'MANAGER' &&
+      passwordMatchedUser.role !== 'TENANT'
+    ) {
+      return res.status(403).json({
+        code: 'ADMIN_DISABLED',
+        error: 'Platform admin access is temporarily unavailable. Please sign in with an owner or student account.',
+      });
+    }
+
+    const matchedRole: AppUserRole = passwordMatchedUser.role;
+
+    if (!passwordMatchedUser.isActive) {
+      return res.status(403).json({
+        code: 'ACCOUNT_DISABLED',
+        error: 'This account has been deactivated. Please contact your administrator.',
+      });
+    }
+
+    if (
+      isEmailVerificationEnabled() &&
+      matchedRole === 'TENANT' &&
+      passwordMatchedUser.emailVerified === false
+    ) {
+      return res.status(403).json({
+        code: 'EMAIL_NOT_VERIFIED',
+        error: 'Please verify your email address before accessing your resident portal.',
+        requiresOtp: true,
+        email: passwordMatchedUser.email,
+      });
+    }
+
+    // Authentication succeeded; load profile/workspace separately so profile failures
+    // are never misreported as invalid credentials.
+    let org: typeof schema.organizations.$inferSelect | undefined;
     try {
       await db
         .update(schema.users)
         .set({ lastLoginAt: new Date(), updatedAt: new Date() })
-        .where(eq(schema.users.id, user.id));
-    } catch (err) {
-      const error = err as { code?: string; message?: string };
-      if (error.code !== '42703') {
-        throw err;
-      }
-      console.warn('Skipping last-login timestamp because the database column is not available yet:', {
-        code: error.code,
-        message: error.message,
+        .where(eq(schema.users.id, passwordMatchedUser.id));
+
+      const [foundOrg] = await db
+        .select()
+        .from(schema.organizations)
+        .where(eq(schema.organizations.id, passwordMatchedUser.organizationId))
+        .limit(1);
+      org = foundOrg;
+    } catch (profileErr) {
+      const anyErr = profileErr as { code?: string; message?: string } | null;
+      console.error('Login profile loading failure:', {
+        userId: passwordMatchedUser.id,
+        code: anyErr?.code,
+        message: anyErr?.message || 'Profile query failed',
+      });
+      return res.status(500).json({
+        code: 'PROFILE_LOAD_FAILED',
+        error: 'Login successful, but your account profile could not be loaded. Please contact support.',
       });
     }
 
-    if (user.role === 'ADMIN') {
-      await logAudit({
-        user: serializeSessionUser(user),
-        action: 'ADMIN_LOGIN',
-        entityType: 'USER',
-        entityId: user.id,
-        metadata: { email: user.email },
+    if (!org) {
+      console.error('Login profile missing organization:', {
+        userId: passwordMatchedUser.id,
+        organizationId: passwordMatchedUser.organizationId,
+      });
+      return res.status(500).json({
+        code: 'PROFILE_LOAD_FAILED',
+        error: 'Login successful, but your account profile could not be loaded. Please contact support.',
       });
     }
 
-    const org =
-      user.role === 'ADMIN'
-        ? null
-        : (
-            await db
-              .select()
-              .from(schema.organizations)
-              .where(eq(schema.organizations.id, user.organizationId))
-              .limit(1)
-          )[0] || null;
-
-    const { token, cookieOnly } = await issueUserSession(req, res, user);
+    let sessionResult: { token: string; cookieOnly: boolean; sessionId: string };
+    try {
+      sessionResult = await issueUserSession(req, res, {
+        id: passwordMatchedUser.id,
+        organizationId: passwordMatchedUser.organizationId,
+        role: matchedRole,
+        tokenVersion: passwordMatchedUser.tokenVersion ?? 1,
+      });
+    } catch (sessionErr) {
+      const anyErr = sessionErr as { code?: string; message?: string } | null;
+      console.error('Login session creation failed:', {
+        userId: passwordMatchedUser.id,
+        code: anyErr?.code,
+        message: anyErr?.message || 'Session insert failed',
+      });
+      return res.status(500).json({
+        code: 'SESSION_CREATE_FAILED',
+        error: 'Could not start your session due to a server database error. Please try again.',
+      });
+    }
 
     return res.json({
-      token: cookieOnly ? undefined : token,
-      cookieOnly,
-      user: serializeSessionUser(user),
+      token: sessionResult.cookieOnly ? undefined : sessionResult.token,
+      cookieOnly: sessionResult.cookieOnly,
+      user: serializeSessionUser({ ...passwordMatchedUser, role: matchedRole }),
       organization: org,
     });
   } catch (err) {
-    const error = err as { message?: string; code?: string };
+    const anyErr = err as { code?: string; message?: string } | null;
     console.error('POST /api/auth/login error:', {
-      message: error.message,
-      code: error.code,
-      error: err,
+      name: err instanceof Error ? err.name : 'UnknownError',
+      code: anyErr?.code,
+      message: anyErr?.message || 'Unexpected login failure',
     });
-    return res.status(500).json({ error: 'Login failed' });
+    return res.status(500).json({ code: 'AUTH_SERVER_ERROR', error: 'Login failed due to a server error' });
   }
 });
 
@@ -652,7 +689,7 @@ authRouter.post('/demo', async (req, res) => {
     if (!isDemoModeEnabled()) {
       return res.status(403).json({ error: 'Demo mode is disabled in this environment.' });
     }
-    await ensureSeeded();
+    await ensureAppReady();
     const requestedRole = String(req.body?.role || 'OWNER').toUpperCase();
     const targetEmail =
       requestedRole === 'TENANT'
@@ -683,16 +720,23 @@ authRouter.post('/demo', async (req, res) => {
       .where(eq(schema.organizations.id, user.organizationId))
       .limit(1);
 
-    const { token, cookieOnly } = await issueUserSession(req, res, user);
+    const demoRole: AppUserRole =
+      user.role === 'MANAGER' || user.role === 'TENANT' ? user.role : 'OWNER';
+    const { token, cookieOnly } = await issueUserSession(req, res, {
+      id: user.id,
+      organizationId: user.organizationId,
+      role: demoRole,
+      tokenVersion: user.tokenVersion ?? 1,
+    });
 
     return res.json({
       token: cookieOnly ? undefined : token,
       cookieOnly,
-      user: serializeSessionUser(user),
+      user: serializeSessionUser({ ...user, role: demoRole }),
       organization: org || null,
     });
   } catch (err) {
-    console.error('POST /api/auth/demo error:', err);
+    console.error('POST /api/auth/demo error:', err instanceof Error ? err.message : err);
     return res.status(500).json({ error: 'Failed to start demo session' });
   }
 });

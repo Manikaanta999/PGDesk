@@ -31,6 +31,10 @@ function formatRupeesAscii(val: number): string {
 }
 
 export async function generateReceiptPdfBytes(data: ReceiptPdfInput): Promise<Uint8Array> {
+  if (!Number.isFinite(data.paidAmount) || data.paidAmount <= 0 || !data.payments || data.payments.length === 0) {
+    throw new Error('Receipt cannot be generated for an unpaid invoice with zero received payments.');
+  }
+
   const doc = await PDFDocument.create();
   const page = doc.addPage([595, 842]); // A4
   const fontRegular = await doc.embedFont(StandardFonts.Helvetica);

@@ -4,11 +4,12 @@ import { ColumnDef } from '@tanstack/react-table';
 import { Check, Download, Plus, Upload, X } from 'lucide-react';
 import { DashboardLayout } from '../../components/layout/DashboardLayout';
 import { DataTable } from '../../components/ui/DataTable';
+import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
 import { apiFetch } from '../../lib/api';
-import { validateMaskedIdNumber } from '../../lib/billing';
-import { formatAccountLinkStatus, formatTenantStatus } from '../../lib/dashboardHelpers';
+import { calculateAdmissionInvoice, deriveInvoiceStatus, validateMaskedIdNumber } from '../../lib/billing';
+import { formatAccountLinkStatus, formatInvoiceStatus, formatTenantStatus } from '../../lib/dashboardHelpers';
 import { formatDateIN, formatIndianPhone, formatINR } from '../../lib/format';
 import { buildTenantsCsv, getTenantsCsvFilename } from '../../lib/tenantCsv';
 
@@ -29,6 +30,9 @@ interface TenantRow {
   securityDeposit: number;
   joinDate: string;
   balanceDue: number;
+  paidTotal?: number;
+  invoiceCount?: number;
+  rentStatus?: string;
   occupation: string;
   companyOrCollege: string;
 }
@@ -49,6 +53,7 @@ interface BedOption {
 
 export function TenantsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { organization } = useAuth();
   const { tHeading } = useLanguage();
   const { showToast } = useToast();
 
@@ -65,6 +70,11 @@ export function TenantsPage() {
   const [vacantBeds, setVacantBeds] = useState<BedOption[]>([]);
   const [uploadingId, setUploadingId] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [admissionIdempotencyKey, setAdmissionIdempotencyKey] = useState(() =>
+    typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `adm-${Date.now()}`
+  );
+
+  const todayStr = new Date().toISOString().slice(0, 10);
 
   const [form, setForm] = useState({
     enquiryId: searchParams.get('enquiryId') ? Number(searchParams.get('enquiryId')) : undefined as number | undefined,
@@ -81,10 +91,15 @@ export function TenantsPage() {
     idDocumentUrl: '',
     propertyId: Number(searchParams.get('propertyId') || 0),
     bedId: Number(searchParams.get('bedId') || 0),
-    joinDate: new Date().toISOString().slice(0, 10),
+    joinDate: todayStr,
     monthlyRent: Number(searchParams.get('rent') || 12000),
     securityDeposit: Number(searchParams.get('rent') || 12000) * 2,
-    generateJoiningInvoice: false,
+    generateJoiningInvoice: true,
+    paymentOption: 'NO_PAYMENT' as 'NO_PAYMENT' | 'PAYMENT_RECEIVED',
+    initialPaymentAmount: '',
+    initialPaymentMethod: 'UPI' as 'UPI' | 'CASH' | 'BANK' | 'ONLINE',
+    initialPaymentDate: todayStr,
+    initialPaymentReference: '',
   });
 
   useEffect(() => {
@@ -206,19 +221,78 @@ export function TenantsPage() {
     }
   };
 
+  const admissionPreview = useMemo(
+    () =>
+      calculateAdmissionInvoice({
+        monthlyRent: Math.max(0, Number(form.monthlyRent) || 0),
+        joinDate: form.joinDate || todayStr,
+        gstRatePct: organization?.gstRatePct ?? 0,
+        dueDaysAfterInvoice: organization?.dueDaysAfterInvoice ?? 5,
+        asOfDate: todayStr,
+      }),
+    [form.monthlyRent, form.joinDate, organization?.gstRatePct, organization?.dueDaysAfterInvoice, todayStr]
+  );
+
   const handleOnboardSubmit = async () => {
+    if (submitting) return;
+    if (form.monthlyRent < 1000) {
+      showToast('Monthly rent must be at least ₹1,000', 'error');
+      return;
+    }
+    const isPaymentReceived = form.paymentOption === 'PAYMENT_RECEIVED';
+    const parsedInitialAmount = Number(form.initialPaymentAmount);
+
+    if (isPaymentReceived) {
+      if (!Number.isFinite(parsedInitialAmount) || parsedInitialAmount <= 0) {
+        showToast('Enter an amount received greater than ₹0.', 'error');
+        return;
+      }
+      if (!Number.isInteger(parsedInitialAmount)) {
+        showToast('Enter a whole rupee amount.', 'error');
+        return;
+      }
+      if (parsedInitialAmount > admissionPreview.amount) {
+        showToast(
+          `Amount received (${formatINR(parsedInitialAmount)}) cannot exceed the billed rent (${formatINR(admissionPreview.amount)}).`,
+          'error'
+        );
+        return;
+      }
+      if (!form.initialPaymentDate) {
+        showToast('Select the date the payment was received.', 'error');
+        return;
+      }
+    }
+
     setSubmitting(true);
     try {
       const onboardedName = form.name;
-      const { enquiryId, ...rest } = form;
+      const { enquiryId, initialPaymentAmount: _rawAmt, ...rest } = form;
       await apiFetch('/api/tenants', {
         method: 'POST',
         body: JSON.stringify({
           ...rest,
+          generateJoiningInvoice: true,
+          paymentOption: form.paymentOption,
+          ...(isPaymentReceived
+            ? {
+                initialPaymentAmount: parsedInitialAmount,
+                initialPaymentMethod: form.initialPaymentMethod,
+                initialPaymentDate: form.initialPaymentDate,
+                initialPaymentReference: form.initialPaymentReference.trim(),
+              }
+            : {
+                initialPaymentAmount: 0,
+              }),
+          idempotencyKey: admissionIdempotencyKey,
           ...(enquiryId ? { enquiryId } : {}),
         }),
       });
-      showToast(`${onboardedName} onboarded and bed assigned!`);
+      showToast(
+        isPaymentReceived
+          ? `${onboardedName} admitted and ₹${parsedInitialAmount.toLocaleString('en-IN')} payment recorded!`
+          : `${onboardedName} admitted! Rent invoice created as Unpaid.`
+      );
       setWizardOpen(false);
       setStep(1);
       setSearch('');
@@ -226,6 +300,10 @@ export function TenantsPage() {
       setPropertyFilter('');
       setDueOnly(false);
       setSearchParams({});
+      const nextKey =
+        typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `adm-${Date.now()}`;
+      setAdmissionIdempotencyKey(nextKey);
+      const resetToday = new Date().toISOString().slice(0, 10);
       setForm({
         enquiryId: undefined,
         name: '',
@@ -241,10 +319,15 @@ export function TenantsPage() {
         idDocumentUrl: '',
         propertyId: properties[0]?.id || 0,
         bedId: 0,
-        joinDate: new Date().toISOString().slice(0, 10),
+        joinDate: resetToday,
         monthlyRent: 12000,
         securityDeposit: 24000,
-        generateJoiningInvoice: false,
+        generateJoiningInvoice: true,
+        paymentOption: 'NO_PAYMENT',
+        initialPaymentAmount: '',
+        initialPaymentMethod: 'UPI',
+        initialPaymentDate: resetToday,
+        initialPaymentReference: '',
       });
       const fresh = await apiFetch<{ tenants: TenantRow[] }>('/api/tenants?pageSize=100');
       setTenants(fresh.tenants);
@@ -320,15 +403,28 @@ export function TenantsPage() {
       {
         accessorKey: 'balanceDue',
         header: 'Due Balance',
-        cell: ({ row }) => (
-          <span
-            className={`font-mono text-sm font-semibold tabular-nums ${
-              row.original.balanceDue > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-400'
-            }`}
-          >
-            {row.original.balanceDue > 0 ? formatINR(row.original.balanceDue) : 'Cleared'}
-          </span>
-        ),
+        cell: ({ row }) => {
+          const { balanceDue, invoiceCount, rentStatus } = row.original;
+          const noInvoiceYet = invoiceCount === 0 || rentStatus === 'NO_INVOICE';
+          if (balanceDue > 0) {
+            return (
+              <div>
+                <span className="font-mono text-sm font-semibold tabular-nums text-red-600 dark:text-red-400">
+                  {formatINR(balanceDue)}
+                </span>
+                {rentStatus && (
+                  <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                    {formatInvoiceStatus(rentStatus)}
+                  </p>
+                )}
+              </div>
+            );
+          }
+          if (noInvoiceYet) {
+            return <span className="font-mono text-xs font-semibold text-amber-700 dark:text-amber-400">Unpaid</span>;
+          }
+          return <span className="font-mono text-sm font-semibold text-emerald-700 dark:text-emerald-400">Paid</span>;
+        },
       },
       {
         accessorKey: 'status',
@@ -374,6 +470,9 @@ export function TenantsPage() {
           <button
             type="button"
             onClick={() => {
+              setAdmissionIdempotencyKey(
+                typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `adm-${Date.now()}`
+              );
               setStep(1);
               setWizardOpen(true);
             }}
@@ -448,10 +547,18 @@ export function TenantsPage() {
                 <span className="text-slate-500 dark:text-slate-400">Due: </span>
                 <span
                   className={`font-mono font-semibold ${
-                    t.balanceDue > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-400'
+                    t.balanceDue > 0
+                      ? 'text-red-600 dark:text-red-400'
+                      : t.invoiceCount === 0 || t.rentStatus === 'NO_INVOICE'
+                        ? 'text-amber-700 dark:text-amber-400'
+                        : 'text-emerald-700 dark:text-emerald-400'
                   }`}
                 >
-                  {t.balanceDue > 0 ? formatINR(t.balanceDue) : 'Cleared'}
+                  {t.balanceDue > 0
+                    ? `${formatINR(t.balanceDue)}${t.rentStatus ? ` (${formatInvoiceStatus(t.rentStatus)})` : ''}`
+                    : t.invoiceCount === 0 || t.rentStatus === 'NO_INVOICE'
+                      ? 'Unpaid'
+                      : 'Paid'}
                 </span>
                 <span className="ml-2 text-slate-400">· Joined {formatDateIN(t.joinDate)}</span>
               </div>
@@ -541,11 +648,12 @@ export function TenantsPage() {
                   />
                 </div>
                 <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">
-                  Provide at least a mobile number or an email address. Student account creation is optional and can be linked later.
+                  Mobile number is required for resident records. Student login account linking is optional.
                 </div>
                 <div>
-                  <label className="block text-xs font-medium">Mobile Number</label>
+                  <label className="block text-xs font-medium">Mobile Number *</label>
                   <input
+                    required
                     value={form.phone}
                     onChange={(e) => setForm({ ...form, phone: e.target.value })}
                     placeholder="+91 98765 43210"
@@ -708,47 +816,247 @@ export function TenantsPage() {
               </div>
             )}
 
-            {step === 4 && (
-              <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                <div>
-                  <label className="block text-xs font-medium">Move-In Date</label>
-                  <input
-                    type="date"
-                    value={form.joinDate}
-                    onChange={(e) => setForm({ ...form, joinDate: e.target.value })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                  />
+            {step === 4 && (() => {
+              const isPaymentReceived = form.paymentOption === 'PAYMENT_RECEIVED';
+              const parsedPaid = isPaymentReceived
+                ? Math.max(0, Math.round(Number(form.initialPaymentAmount) || 0))
+                : 0;
+              const effectivePaid = Math.min(admissionPreview.amount, parsedPaid);
+              const balanceAfter = Math.max(0, admissionPreview.amount - effectivePaid);
+              const resultingStatus = deriveInvoiceStatus({
+                amount: admissionPreview.amount,
+                paidAmount: effectivePaid,
+                dueDate: admissionPreview.dueDate,
+                asOfDate: todayStr,
+              });
+
+              return (
+                <div className="mt-5 space-y-4">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div>
+                      <label className="block text-xs font-medium">Move-In Date *</label>
+                      <input
+                        type="date"
+                        value={form.joinDate}
+                        onChange={(e) => setForm({ ...form, joinDate: e.target.value })}
+                        className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium">Monthly Rent (₹) *</label>
+                      <input
+                        type="number"
+                        min={1000}
+                        value={form.monthlyRent}
+                        onChange={(e) => setForm({ ...form, monthlyRent: Number(e.target.value) })}
+                        className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium">Security Deposit (₹)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={form.securityDeposit}
+                        onChange={(e) => setForm({ ...form, securityDeposit: Number(e.target.value) })}
+                        className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Admission Invoice Calculation Summary */}
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-950">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                        Joining Rent Invoice ({admissionPreview.isProRata ? `Pro-rata ${admissionPreview.billableDays}/${admissionPreview.totalDaysInMonth} days` : 'Full month'})
+                      </span>
+                      <span className="font-mono text-sm font-bold tabular-nums text-slate-900 dark:text-white">
+                        {formatINR(admissionPreview.amount)}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                      Due date: {formatDateIN(admissionPreview.dueDate)}
+                      {admissionPreview.gstRatePct > 0 ? ` · Includes ${admissionPreview.gstRatePct}% GST` : ''}
+                    </p>
+                  </div>
+
+                  {/* Explicit Payment Confirmation Section */}
+                  <div className="rounded-lg border border-slate-200 p-4 dark:border-slate-800">
+                    <p className="text-xs font-semibold text-slate-900 dark:text-white">
+                      Has the student paid any rent?
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                      New admissions default to Unpaid unless you explicitly confirm money received.
+                    </p>
+
+                    <div className="mt-3 space-y-2">
+                      <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 text-xs hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50">
+                        <input
+                          type="radio"
+                          name="admissionPaymentOption"
+                          value="NO_PAYMENT"
+                          checked={form.paymentOption === 'NO_PAYMENT'}
+                          onChange={() =>
+                            setForm((prev) => ({
+                              ...prev,
+                              paymentOption: 'NO_PAYMENT',
+                              initialPaymentAmount: '',
+                              initialPaymentReference: '',
+                            }))
+                          }
+                          className="mt-0.5"
+                        />
+                        <span>
+                          <strong className="block text-slate-900 dark:text-white">
+                            No payment received
+                          </strong>
+                          <span className="text-slate-500 dark:text-slate-400">
+                            Record ₹0 paid. Outstanding balance is {formatINR(admissionPreview.amount)} (Unpaid). No receipt is generated.
+                          </span>
+                        </span>
+                      </label>
+
+                      <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 text-xs hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50">
+                        <input
+                          type="radio"
+                          name="admissionPaymentOption"
+                          value="PAYMENT_RECEIVED"
+                          checked={form.paymentOption === 'PAYMENT_RECEIVED'}
+                          onChange={() =>
+                            setForm((prev) => ({
+                              ...prev,
+                              paymentOption: 'PAYMENT_RECEIVED',
+                              initialPaymentDate: prev.initialPaymentDate || todayStr,
+                            }))
+                          }
+                          className="mt-0.5"
+                        />
+                        <span>
+                          <strong className="block text-slate-900 dark:text-white">
+                            Yes, payment received
+                          </strong>
+                          <span className="text-slate-500 dark:text-slate-400">
+                            Enter the exact amount collected today (full or partial) to save a verified payment transaction.
+                          </span>
+                        </span>
+                      </label>
+                    </div>
+
+                    {isPaymentReceived && (
+                      <div className="mt-4 grid gap-3 border-t border-slate-100 pt-4 sm:grid-cols-2 dark:border-slate-800">
+                        <div className="sm:col-span-2">
+                          <div className="flex items-center justify-between">
+                            <label htmlFor="admission-amount-received" className="block text-xs font-medium">
+                              Amount Received (₹) *
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setForm((prev) => ({
+                                  ...prev,
+                                  initialPaymentAmount: String(admissionPreview.amount),
+                                }))
+                              }
+                              className="text-[11px] font-semibold text-teal-700 hover:underline dark:text-teal-400"
+                            >
+                              Fill full rent ({formatINR(admissionPreview.amount)})
+                            </button>
+                          </div>
+                          <input
+                            id="admission-amount-received"
+                            type="number"
+                            min={1}
+                            max={admissionPreview.amount}
+                            required
+                            value={form.initialPaymentAmount}
+                            onChange={(e) => setForm({ ...form, initialPaymentAmount: e.target.value })}
+                            placeholder={`1 – ${admissionPreview.amount}`}
+                            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                          />
+                        </div>
+                        <div>
+                          <label htmlFor="admission-payment-method" className="block text-xs font-medium">
+                            Payment Method *
+                          </label>
+                          <select
+                            id="admission-payment-method"
+                            value={form.initialPaymentMethod}
+                            onChange={(e) => setForm({ ...form, initialPaymentMethod: e.target.value as any })}
+                            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                          >
+                            <option value="UPI">UPI</option>
+                            <option value="CASH">Cash</option>
+                            <option value="BANK">Bank / IMPS</option>
+                            <option value="ONLINE">Online</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label htmlFor="admission-payment-date" className="block text-xs font-medium">
+                            Payment Date *
+                          </label>
+                          <input
+                            id="admission-payment-date"
+                            type="date"
+                            required
+                            value={form.initialPaymentDate}
+                            onChange={(e) => setForm({ ...form, initialPaymentDate: e.target.value })}
+                            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                          />
+                        </div>
+                        <div className="sm:col-span-2">
+                          <label htmlFor="admission-payment-ref" className="block text-xs font-medium">
+                            UTR / Receipt Reference (Optional)
+                          </label>
+                          <input
+                            id="admission-payment-ref"
+                            value={form.initialPaymentReference}
+                            onChange={(e) => setForm({ ...form, initialPaymentReference: e.target.value })}
+                            placeholder="e.g., UTR63119884210 or Cash Receipt #12"
+                            className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Live Resulting Invoice State */}
+                  <div className="grid grid-cols-4 gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs tabular-nums dark:border-slate-800 dark:bg-slate-950">
+                    <div>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">Billed</p>
+                      <p className="font-mono font-semibold text-slate-900 dark:text-white">
+                        {formatINR(admissionPreview.amount)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">Paid</p>
+                      <p className="font-mono font-semibold text-emerald-700 dark:text-emerald-400">
+                        {formatINR(effectivePaid)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">Balance</p>
+                      <p className="font-mono font-semibold text-red-600 dark:text-red-400">
+                        {formatINR(balanceAfter)}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">Status</p>
+                      <p
+                        className={`font-semibold ${
+                          resultingStatus === 'PAID'
+                            ? 'text-emerald-700 dark:text-emerald-400'
+                            : resultingStatus === 'OVERDUE'
+                              ? 'text-red-600 dark:text-red-400'
+                              : 'text-amber-700 dark:text-amber-400'
+                        }`}
+                      >
+                        {formatInvoiceStatus(resultingStatus)}
+                      </p>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <label className="block text-xs font-medium">Monthly Rent (₹)</label>
-                  <input
-                    type="number"
-                    value={form.monthlyRent}
-                    onChange={(e) => setForm({ ...form, monthlyRent: Number(e.target.value) })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium">Security Deposit (₹)</label>
-                  <input
-                    type="number"
-                    value={form.securityDeposit}
-                    onChange={(e) => setForm({ ...form, securityDeposit: Number(e.target.value) })}
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                  />
-                </div>
-                <div className="flex items-end pb-2">
-                  <label className="inline-flex items-center gap-2 text-xs font-medium">
-                    <input
-                      type="checkbox"
-                      checked={form.generateJoiningInvoice}
-                      onChange={(e) => setForm({ ...form, generateJoiningInvoice: e.target.checked })}
-                    />
-                    <span>Auto-generate pro-rata joining invoice</span>
-                  </label>
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             <div className="mt-6 flex items-center justify-between border-t border-slate-200 pt-4 dark:border-slate-800">
               <button
@@ -767,19 +1075,11 @@ export function TenantsPage() {
                         showToast('Resident full name is required', 'error');
                         return;
                       }
-                      const hasPhone = form.phone.trim().length > 0;
-                      const hasEmail = form.email.trim().length > 0;
-                      if (!hasPhone && !hasEmail) {
-                        showToast('Provide at least a mobile number or an email address', 'error');
+                      const digits = form.phone.replace(/\D/g, '');
+                      const okPhone = digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+                      if (!okPhone) {
+                        showToast('Enter a valid 10-digit Indian mobile number', 'error');
                         return;
-                      }
-                      if (hasPhone) {
-                        const digits = form.phone.replace(/\D/g, '');
-                        const okPhone = digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
-                        if (!okPhone) {
-                          showToast('Enter a valid 10-digit Indian mobile number or leave blank', 'error');
-                          return;
-                        }
                       }
                     }
                     if (step === 2) {

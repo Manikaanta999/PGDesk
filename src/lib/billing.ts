@@ -131,17 +131,166 @@ export function computeLateFee(params: {
   return chargeableDays * params.lateFeePerDay;
 }
 
+export function addDaysYmd(ymd: string, days: number): string {
+  const parsed = parseYMD(ymd);
+  if (!parsed) return ymd;
+  const utc = Date.UTC(parsed.year, parsed.month - 1, parsed.day + Math.round(days));
+  const d = new Date(utc);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
 export function deriveInvoiceStatus(params: {
   amount: number;
   paidAmount: number;
   dueDate: string;
   asOfDate: string;
-}): 'PAID' | 'PARTIAL' | 'OVERDUE' | 'PENDING' {
-  if (params.paidAmount >= params.amount && params.amount > 0) return 'PAID';
-  if (params.paidAmount > 0 && params.paidAmount < params.amount) {
-    return params.asOfDate > params.dueDate ? 'OVERDUE' : 'PARTIAL';
+}): 'PAID' | 'PARTIAL' | 'OVERDUE' | 'UNPAID' {
+  const totalAmount = Math.max(0, Math.round(params.amount));
+  const paidAmount = Math.max(0, Math.round(params.paidAmount));
+  if (totalAmount <= 0 || paidAmount >= totalAmount) return 'PAID';
+  if (params.asOfDate > params.dueDate) return 'OVERDUE';
+  if (paidAmount > 0) return 'PARTIAL';
+  return 'UNPAID';
+}
+
+export interface PaymentLike {
+  amount: number;
+  approvalStatus?: string | null;
+}
+
+export function computeApprovedPaidAmount(payments: PaymentLike[]): number {
+  return payments.reduce((sum, p) => {
+    if (String(p.approvalStatus || '').toUpperCase() === 'APPROVED') {
+      return sum + Math.max(0, Math.round(Number(p.amount) || 0));
+    }
+    return sum;
+  }, 0);
+}
+
+export function reconcileInvoiceWithPayments(
+  invoice: { amount: number; dueDate: string },
+  payments: PaymentLike[],
+  asOfDate: string
+): {
+  paidAmount: number;
+  balanceDue: number;
+  status: 'PAID' | 'PARTIAL' | 'OVERDUE' | 'UNPAID';
+  approvedCount: number;
+} {
+  const approved = payments.filter(
+    (p) => String(p.approvalStatus || '').toUpperCase() === 'APPROVED' && Number(p.amount) > 0
+  );
+  const rawPaid = approved.reduce((s, p) => s + Math.round(Number(p.amount) || 0), 0);
+  const totalAmount = Math.max(0, Math.round(invoice.amount));
+  const paidAmount = Math.min(totalAmount, rawPaid);
+  const balanceDue = Math.max(0, totalAmount - paidAmount);
+  const status = deriveInvoiceStatus({
+    amount: totalAmount,
+    paidAmount,
+    dueDate: invoice.dueDate,
+    asOfDate,
+  });
+  return {
+    paidAmount,
+    balanceDue,
+    status,
+    approvedCount: approved.length,
+  };
+}
+
+export function canDownloadInvoiceReceipt(params: {
+  paidAmount: number;
+  approvedCount?: number;
+}): boolean {
+  if (!Number.isFinite(params.paidAmount) || params.paidAmount <= 0) return false;
+  if (params.approvedCount !== undefined && params.approvedCount <= 0) return false;
+  return true;
+}
+
+export interface AdmissionInvoiceInput {
+  monthlyRent: number;
+  joinDate: string; // YYYY-MM-DD
+  gstRatePct?: number;
+  dueDaysAfterInvoice?: number;
+  asOfDate?: string; // YYYY-MM-DD
+}
+
+export interface AdmissionInvoiceResult {
+  amount: number;
+  taxableValue: number;
+  cgstAmount: number;
+  sgstAmount: number;
+  gstRatePct: number;
+  isProRata: boolean;
+  billableDays: number;
+  totalDaysInMonth: number;
+  periodYear: number;
+  periodMonth: number;
+  periodStart: string;
+  periodEnd: string;
+  dueDate: string;
+  status: 'UNPAID' | 'OVERDUE';
+  items: Array<{ label: string; type: 'RENT' | 'OTHER'; amount: number }>;
+}
+
+export function calculateAdmissionInvoice(input: AdmissionInvoiceInput): AdmissionInvoiceResult {
+  const parsedJoin = parseYMD(input.joinDate);
+  const fallbackNow = new Date();
+  const jy = parsedJoin?.year ?? fallbackNow.getUTCFullYear();
+  const jm = parsedJoin?.month ?? fallbackNow.getUTCMonth() + 1;
+  const normalizedJoin = parsedJoin ? input.joinDate : `${jy}-${pad2(jm)}-01`;
+
+  const calc = calculateProRataRent({
+    monthlyRent: Math.max(0, Math.round(input.monthlyRent)),
+    year: jy,
+    month: jm,
+    joinDate: normalizedJoin,
+  });
+
+  const dueDays = Math.max(0, Math.round(input.dueDaysAfterInvoice ?? 5));
+  const dueDate = addDaysYmd(normalizedJoin, dueDays);
+  const gst = calculateGstBreakdown(calc.amount, input.gstRatePct ?? 0);
+  const items: Array<{ label: string; type: 'RENT' | 'OTHER'; amount: number }> = [
+    {
+      label: calc.isProRata
+        ? `Pro-rata Rent (${calc.billableDays}/${calc.totalDaysInMonth} days)`
+        : 'Monthly Bed Rent',
+      type: 'RENT',
+      amount: gst.taxableValue,
+    },
+  ];
+  if (gst.gstRatePct > 0) {
+    items.push(
+      { label: `CGST (${gst.cgstRatePct}%)`, type: 'OTHER', amount: gst.cgstAmount },
+      { label: `SGST (${gst.sgstRatePct}%)`, type: 'OTHER', amount: gst.sgstAmount }
+    );
   }
-  return params.asOfDate > params.dueDate ? 'OVERDUE' : 'PENDING';
+
+  const asOfDate = input.asOfDate || normalizedJoin;
+  const derived = deriveInvoiceStatus({
+    amount: gst.totalWithGst,
+    paidAmount: 0,
+    dueDate,
+    asOfDate,
+  });
+
+  return {
+    amount: gst.totalWithGst,
+    taxableValue: gst.taxableValue,
+    cgstAmount: gst.cgstAmount,
+    sgstAmount: gst.sgstAmount,
+    gstRatePct: gst.gstRatePct,
+    isProRata: calc.isProRata,
+    billableDays: calc.billableDays,
+    totalDaysInMonth: calc.totalDaysInMonth,
+    periodYear: jy,
+    periodMonth: jm,
+    periodStart: calc.periodStart,
+    periodEnd: calc.periodEnd,
+    dueDate,
+    status: derived === 'OVERDUE' ? 'OVERDUE' : 'UNPAID',
+    items,
+  };
 }
 
 export function calculateDepositSettlement(params: {

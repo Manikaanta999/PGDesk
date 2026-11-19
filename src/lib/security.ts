@@ -1,8 +1,8 @@
-import 'dotenv/config';
 import crypto from 'node:crypto';
 
-const SESSION_SECRET =
-  process.env.SESSION_SECRET || 'pgdesk-dev-session-secret-change-in-production-2026';
+function getSessionSecret(): string {
+  return process.env.SESSION_SECRET || 'pgdesk-dev-session-secret-change-in-production-2026';
+}
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -11,21 +11,26 @@ export function hashPassword(password: string): string {
 }
 
 export function verifyPassword(password: string, storedHash: string | null | undefined): boolean {
-  if (!storedHash || !storedHash.includes(':')) return false;
-  const [salt, keyHex] = storedHash.split(':');
-  if (!salt || !keyHex) return false;
-  const derived = crypto.scryptSync(password, salt, 64);
-  const keyBuf = Buffer.from(keyHex, 'hex');
-  if (derived.length !== keyBuf.length) return false;
-  return crypto.timingSafeEqual(derived, keyBuf);
+  if (!password || !storedHash || !storedHash.includes(':')) return false;
+  try {
+    const [salt, keyHex] = storedHash.split(':');
+    if (!salt || !keyHex || keyHex.length % 2 !== 0) return false;
+    const derived = crypto.scryptSync(password, salt, 64);
+    const keyBuf = Buffer.from(keyHex, 'hex');
+    if (derived.length === 0 || derived.length !== keyBuf.length) return false;
+    return crypto.timingSafeEqual(derived, keyBuf);
+  } catch {
+    return false;
+  }
 }
 
 export interface SessionPayload {
   userId: number;
   organizationId: number;
-  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+  role: 'OWNER' | 'MANAGER' | 'TENANT';
   tv?: number;
   sid?: string;
+  am?: 'SESSION' | 'GOOGLE';
   exp: number;
 }
 
@@ -35,7 +40,7 @@ export function signSessionToken(payload: Omit<SessionPayload, 'exp'>, ttlSecond
     exp: Math.floor(Date.now() / 1000) + ttlSeconds,
   };
   const body = Buffer.from(JSON.stringify(full)).toString('base64url');
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  const sig = crypto.createHmac('sha256', getSessionSecret()).update(body).digest('base64url');
   return `${body}.${sig}`;
 }
 
@@ -43,7 +48,7 @@ export function verifySessionToken(token: string | undefined | null): SessionPay
   if (!token || !token.includes('.')) return null;
   const [body, sig] = token.split('.');
   if (!body || !sig) return null;
-  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
+  const expectedSig = crypto.createHmac('sha256', getSessionSecret()).update(body).digest('base64url');
   const a = Buffer.from(sig);
   const b = Buffer.from(expectedSig);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
@@ -102,3 +107,4 @@ export function verifyCronSecret(authHeader: string | undefined, expectedSecret:
   if (a.length === 0 || a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
+

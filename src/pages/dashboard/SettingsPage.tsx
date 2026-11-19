@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { Building2, HelpCircle, Plus, ShieldCheck, X } from 'lucide-react';
+import { Building2, HelpCircle, KeyRound, Plus, ShieldCheck, X } from 'lucide-react';
 import { AccountSettingsPanel } from '../../components/account/AccountSettingsPanel';
 import { DashboardLayout } from '../../components/layout/DashboardLayout';
 import { LanguageSwitcher } from '../../components/ui/LanguageSwitcher';
@@ -57,6 +57,20 @@ export function SettingsPage() {
     limits: { label: string; maxProperties: number | null; maxBeds: number | null };
   } | null>(null);
   const [staff, setStaff] = useState<Array<{ id: number; name: string; email: string; phone: string | null; role: string }>>([]);
+  const [adminUsers, setAdminUsers] = useState<
+    Array<{ id: number; name: string; email: string; phone: string | null; role: 'MANAGER' | 'TENANT'; hasPassword: boolean }>
+  >([]);
+  const [adminUserSearch, setAdminUserSearch] = useState('');
+  const [resetTarget, setResetTarget] = useState<{
+    id: number;
+    name: string;
+    email: string;
+    role: string;
+  } | null>(null);
+  const [adminNewPassword, setAdminNewPassword] = useState('');
+  const [adminConfirmPassword, setAdminConfirmPassword] = useState('');
+  const [adminResetBusy, setAdminResetBusy] = useState(false);
+
   const [auditLogs, setAuditLogs] = useState<Array<{ id: number; actorName: string; actorRole: string; action: string; entityType: string; createdAt: string }>>([]);
   const [saving, setSaving] = useState(false);
 
@@ -68,6 +82,8 @@ export function SettingsPage() {
     password: '',
     role: 'MANAGER' as 'OWNER' | 'MANAGER',
   });
+
+  const isOwner = user?.role === 'OWNER';
 
   const loadSettings = useCallback(async () => {
     try {
@@ -98,10 +114,23 @@ export function SettingsPage() {
       }
       setStaff(res.staff || []);
       setAuditLogs(res.auditLogs || []);
+      if (isOwner) {
+        const adminRes = await apiFetch<{
+          users: Array<{
+            id: number;
+            name: string;
+            email: string;
+            phone: string | null;
+            role: 'MANAGER' | 'TENANT';
+            hasPassword: boolean;
+          }>;
+        }>('/api/admin/users');
+        setAdminUsers(adminRes.users || []);
+      }
     } catch (err: any) {
       showToast(err.message || 'Failed to load settings', 'error');
     }
-  }, [showToast]);
+  }, [isOwner, showToast]);
 
   useEffect(() => {
     loadSettings();
@@ -141,7 +170,46 @@ export function SettingsPage() {
     }
   };
 
-  const isOwner = user?.role === 'OWNER';
+  const handleAdminResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resetTarget) return;
+    if (adminNewPassword.length < 6) {
+      showToast('Temporary password must be at least 6 characters', 'error');
+      return;
+    }
+    if (adminNewPassword !== adminConfirmPassword) {
+      showToast('Passwords do not match', 'error');
+      return;
+    }
+    setAdminResetBusy(true);
+    try {
+      const res = await apiFetch<{ message: string }>(`/api/admin/users/${resetTarget.id}/reset-password`, {
+        method: 'POST',
+        body: JSON.stringify({ newPassword: adminNewPassword }),
+      });
+      showToast(res.message);
+      setResetTarget(null);
+      setAdminNewPassword('');
+      setAdminConfirmPassword('');
+      await loadSettings();
+    } catch (err: any) {
+      showToast(err.message || 'Failed to reset user password', 'error');
+    } finally {
+      setAdminResetBusy(false);
+    }
+  };
+
+  const filteredAdminUsers = adminUsers.filter((u) => {
+    const q = adminUserSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      u.name.toLowerCase().includes(q) ||
+      u.email.toLowerCase().includes(q) ||
+      (u.phone || '').includes(q) ||
+      u.role.toLowerCase().includes(q)
+    );
+  });
+
   const inputClass =
     'mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-600 focus:outline-none disabled:opacity-60 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100';
 
@@ -500,51 +568,115 @@ export function SettingsPage() {
             </form>
 
             {isOwner && (
-              <div className="grid gap-6 lg:grid-cols-2">
-                <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
-                  <div className="flex items-center justify-between pb-4">
-                    <h2 className="font-display text-base font-semibold">Staff &amp; Hostel Managers</h2>
-                    <button
-                      type="button"
-                      onClick={() => setShowInvite(true)}
-                      className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white dark:bg-teal-700"
-                    >
-                      <Plus className="h-3.5 w-3.5" />
-                      <span>Add Staff</span>
-                    </button>
-                  </div>
-                  <div className="divide-y divide-slate-100 text-xs dark:divide-slate-800">
-                    {staff.map((s) => (
-                      <div key={s.id} className="flex items-center justify-between py-3">
-                        <div>
-                          <p className="font-semibold text-slate-900 dark:text-white">{s.name}</p>
-                          <p className="text-slate-500">
-                            {s.email} {s.phone ? `· ${s.phone}` : ''}
-                          </p>
+              <>
+                <div className="grid gap-6 lg:grid-cols-2">
+                  <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+                    <div className="flex items-center justify-between pb-4">
+                      <h2 className="font-display text-base font-semibold">Staff &amp; Hostel Managers</h2>
+                      <button
+                        type="button"
+                        onClick={() => setShowInvite(true)}
+                        className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white dark:bg-teal-700"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        <span>Add Staff</span>
+                      </button>
+                    </div>
+                    <div className="divide-y divide-slate-100 text-xs dark:divide-slate-800">
+                      {staff.map((s) => (
+                        <div key={s.id} className="flex items-center justify-between gap-3 py-3">
+                          <div>
+                            <p className="font-semibold text-slate-900 dark:text-white">{s.name}</p>
+                            <p className="text-slate-500">
+                              {s.email} {s.phone ? `· ${s.phone}` : ''}
+                            </p>
+                          </div>
+                          <span className="font-mono font-semibold text-teal-700 dark:text-teal-400">{s.role}</span>
                         </div>
-                        <span className="font-mono font-semibold text-teal-700 dark:text-teal-400">{s.role}</span>
-                      </div>
-                    ))}
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+                    <h2 className="pb-4 font-display text-base font-semibold">Sensitive Action Audit Log</h2>
+                    <div className="divide-y divide-slate-100 text-xs dark:divide-slate-800">
+                      {auditLogs.map((log) => (
+                        <div key={log.id} className="flex items-center justify-between py-2.5">
+                          <div>
+                            <p className="font-mono font-medium text-slate-800 dark:text-slate-200">{log.action}</p>
+                            <p className="text-slate-500">
+                              {log.actorName} ({log.actorRole}) · {log.entityType}
+                            </p>
+                          </div>
+                          <span className="text-slate-400 tabular-nums">{formatDateIN(log.createdAt)}</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
+                {/* Owner-Only Password Reset Support during Development/Testing */}
                 <div className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
-                  <h2 className="pb-4 font-display text-base font-semibold">Sensitive Action Audit Log</h2>
-                  <div className="divide-y divide-slate-100 text-xs dark:divide-slate-800">
-                    {auditLogs.map((log) => (
-                      <div key={log.id} className="flex items-center justify-between py-2.5">
-                        <div>
-                          <p className="font-mono font-medium text-slate-800 dark:text-slate-200">{log.action}</p>
-                          <p className="text-slate-500">
-                            {log.actorName} ({log.actorRole}) · {log.entityType}
-                          </p>
-                        </div>
-                        <span className="text-slate-400">{formatDateIN(log.createdAt)}</span>
+                  <div className="flex flex-col justify-between gap-3 border-b border-slate-200 pb-4 sm:flex-row sm:items-center dark:border-slate-800">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <KeyRound className="h-4 w-4 text-teal-700 dark:text-teal-400" />
+                        <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                          Administrator Password Support (Testing)
+                        </h2>
                       </div>
-                    ))}
+                      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                        Email recovery is disabled during testing. Hostel Owners can set a temporary password for
+                        Managers and Residents in this organization.
+                      </p>
+                    </div>
+                    <input
+                      type="search"
+                      aria-label="Search organization accounts"
+                      value={adminUserSearch}
+                      onChange={(e) => setAdminUserSearch(e.target.value)}
+                      placeholder="Search by name, email, or phone"
+                      className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-teal-600 focus:outline-none sm:w-64 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                    />
+                  </div>
+
+                  <div className="mt-3 divide-y divide-slate-100 text-xs dark:divide-slate-800">
+                    {filteredAdminUsers.length === 0 ? (
+                      <p className="py-4 text-slate-500 dark:text-slate-400">
+                        No matching manager or resident accounts in your organization.
+                      </p>
+                    ) : (
+                      filteredAdminUsers.map((u) => (
+                        <div key={u.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
+                          <div className="min-w-0">
+                            <p className="font-semibold text-slate-900 dark:text-white">{u.name}</p>
+                            <p className="text-slate-500 dark:text-slate-400">
+                              <span className="font-mono">{u.email}</span>
+                              {u.phone ? ` · ${u.phone}` : ''}
+                              {' · '}
+                              <span>{u.role === 'MANAGER' ? 'Manager' : 'Resident'}</span>
+                              {' · '}
+                              <span>{u.hasPassword ? 'Password set' : 'No password set'}</span>
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setResetTarget({ id: u.id, name: u.name, email: u.email, role: u.role });
+                              setAdminNewPassword('');
+                              setAdminConfirmPassword('');
+                            }}
+                            aria-label={`Reset password for ${u.name}`}
+                            className="shrink-0 whitespace-nowrap rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800"
+                          >
+                            Reset Password
+                          </button>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
-              </div>
+              </>
             )}
           </>
         )}
@@ -620,6 +752,80 @@ export function SettingsPage() {
               </button>
               <button type="submit" className="rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white">
                 Create Account
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {resetTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4" role="dialog" aria-modal="true">
+          <form
+            onSubmit={handleAdminResetPassword}
+            className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-xl dark:border-slate-800 dark:bg-slate-900"
+          >
+            <div className="flex items-center justify-between pb-3">
+              <h3 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
+                Set Temporary Password
+              </h3>
+              <button type="button" onClick={() => setResetTarget(null)} aria-label="Close password reset modal">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              Resetting password for <strong className="text-slate-900 dark:text-white">{resetTarget.name}</strong> (
+              <span className="font-mono">{resetTarget.email}</span>). Active sessions for this account will be signed
+              out immediately.
+            </p>
+            <div className="mt-4 space-y-3">
+              <div>
+                <label htmlFor="admin-reset-new-pwd" className="block text-xs font-medium">
+                  New Temporary Password (min 6 characters)
+                </label>
+                <input
+                  id="admin-reset-new-pwd"
+                  type="password"
+                  required
+                  minLength={6}
+                  value={adminNewPassword}
+                  onChange={(e) => setAdminNewPassword(e.target.value)}
+                  placeholder="Enter temporary password"
+                  className={inputClass}
+                />
+              </div>
+              <div>
+                <label htmlFor="admin-reset-confirm-pwd" className="block text-xs font-medium">
+                  Confirm Temporary Password
+                </label>
+                <input
+                  id="admin-reset-confirm-pwd"
+                  type="password"
+                  required
+                  minLength={6}
+                  value={adminConfirmPassword}
+                  onChange={(e) => setAdminConfirmPassword(e.target.value)}
+                  placeholder="Re-enter temporary password"
+                  className={inputClass}
+                />
+                {adminConfirmPassword.length > 0 && adminNewPassword !== adminConfirmPassword && (
+                  <p className="mt-1 text-xs text-red-600">Passwords do not match</p>
+                )}
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setResetTarget(null)}
+                className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium dark:border-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={adminResetBusy}
+                className="rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
+              >
+                {adminResetBusy ? 'Updating...' : 'Set Temporary Password'}
               </button>
             </div>
           </form>

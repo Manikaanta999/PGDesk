@@ -2,6 +2,12 @@ import { Router } from 'express';
 import { and, desc, eq, inArray, isNull, ne, or } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import {
+  getAuthTestingPolicy,
+  isEmailVerificationEnabled,
+  isSmsOtpEnabled,
+  shouldRequireCurrentPasswordOnUpdate,
+} from '../../lib/authPolicy.ts';
+import {
   checkRateLimit,
   generateSixDigitOtp,
   hashPassword,
@@ -14,9 +20,9 @@ import {
   changePasswordSchema,
   confirmCodeSchema,
   requestEmailChangeSchema,
+  requestPhoneChangeSchema,
   setOrResetPasswordSchema,
   updateAccountProfileSchema,
-  updateDirectPhoneSchema,
   updateNotificationPrefsSchema,
 } from '../../lib/validation.ts';
 import { AuthRequest, issueUserSession, requireAuth } from '../../middleware/auth.ts';
@@ -28,15 +34,15 @@ const SECURITY_LOG_ACTIONS = [
   'PASSWORD_SET',
   'PASSWORD_CHANGED',
   'PASSWORD_RESET',
+  'ADMIN_PASSWORD_RESET',
   'EMAIL_CHANGED',
-  'EMAIL_VERIFIED',
-  'PHONE_UPDATED',
+  'PHONE_CHANGED',
   'OTHER_SESSIONS_REVOKED',
   'ACCOUNT_PROFILE_UPDATED',
   'OWNER_REGISTERED',
+  'TENANT_OTP_VERIFIED',
   'NOTIFICATION_PREFS_UPDATED',
   'STUDENT_MOVE_OUT_REQUESTED',
-  'ADMIN_LOGIN',
 ];
 
 function normalizePhone10(raw: string): string {
@@ -91,15 +97,19 @@ accountRouter.get('/', requireAuth, async (req: AuthRequest, res) => {
         photoUrl: dbUser.photoUrl || null,
         role: dbUser.role,
         emailVerified: dbUser.emailVerified,
-        phoneVerified: dbUser.phoneVerified,
         lastLoginAt: dbUser.lastLoginAt,
         notificationPrefs: sanitizeNotificationPrefs(dbUser.notificationPrefs),
         pendingEmail: dbUser.pendingEmail || null,
+        pendingPhone: dbUser.pendingPhone || null,
         hasPassword: Boolean(dbUser.passwordHash),
         hasGoogleAuth: Boolean(dbUser.uid),
         signedInWithGoogle: req.authMethod === 'GOOGLE',
-        canResetWithoutCurrentPassword: !dbUser.passwordHash || req.authMethod === 'GOOGLE',
+        canResetWithoutCurrentPassword: !shouldRequireCurrentPasswordOnUpdate({
+          hasPassword: Boolean(dbUser.passwordHash),
+          authMethod: req.authMethod,
+        }),
       },
+      authPolicy: getAuthTestingPolicy(),
       sessions: sessions.map((s) => ({
         id: s.id,
         sessionId: s.sessionId,
@@ -191,15 +201,18 @@ accountRouter.post('/change-password', requireAuth, async (req: AuthRequest, res
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    const allowDirectReset = !dbUser.passwordHash || req.authMethod === 'GOOGLE';
-    const parsed = allowDirectReset
-      ? setOrResetPasswordSchema.safeParse(req.body)
-      : changePasswordSchema.safeParse(req.body);
+    const requireCurrentPassword = shouldRequireCurrentPasswordOnUpdate({
+      hasPassword: Boolean(dbUser.passwordHash),
+      authMethod: req.authMethod,
+    });
+    const parsed = requireCurrentPassword
+      ? changePasswordSchema.safeParse(req.body)
+      : setOrResetPasswordSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid password input' });
     }
 
-    if (!allowDirectReset) {
+    if (requireCurrentPassword) {
       if (!dbUser.passwordHash || !verifyPassword(parsed.data.currentPassword || '', dbUser.passwordHash)) {
         return res.status(400).json({ error: 'Current password is incorrect' });
       }
@@ -239,7 +252,17 @@ accountRouter.post('/change-password', requireAuth, async (req: AuthRequest, res
         .where(and(eq(schema.userSessions.userId, dbUser.id), isNull(schema.userSessions.revokedAt)));
     }
 
-    const sessionResult = await issueUserSession(req, res, updatedUser, req.sessionId);
+    const sessionResult = await issueUserSession(
+      req,
+      res,
+      {
+        id: updatedUser.id,
+        organizationId: updatedUser.organizationId,
+        role: authUser.role,
+        tokenVersion: updatedUser.tokenVersion ?? 1,
+      },
+      req.sessionId
+    );
 
     await logAudit({
       user: authUser,
@@ -294,6 +317,42 @@ accountRouter.post('/email-change/request', requireAuth, async (req: AuthRequest
       return res.status(409).json({ error: 'That email address is already registered to another account' });
     }
 
+    if (!isEmailVerificationEnabled()) {
+      await db
+        .update(schema.users)
+        .set({
+          email: nextEmail,
+          emailVerified: true,
+          pendingEmail: null,
+          pendingEmailCodeHash: null,
+          pendingEmailExpiresAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.users.id, dbUser.id));
+
+      if (dbUser.role === 'TENANT') {
+        await db
+          .update(schema.tenants)
+          .set({ email: nextEmail, updatedAt: new Date() })
+          .where(and(eq(schema.tenants.userId, dbUser.id), isNull(schema.tenants.deletedAt)));
+      }
+
+      await logAudit({
+        user: authUser,
+        action: 'EMAIL_CHANGED',
+        entityType: 'USER',
+        entityId: dbUser.id,
+        metadata: { newEmail: nextEmail },
+      });
+
+      return res.json({
+        ok: true,
+        directUpdate: true,
+        email: nextEmail,
+        message: 'Email address updated.',
+      });
+    }
+
     const code = generateSixDigitOtp();
     await db
       .update(schema.users)
@@ -305,10 +364,6 @@ accountRouter.post('/email-change/request', requireAuth, async (req: AuthRequest
       })
       .where(eq(schema.users.id, dbUser.id));
 
-    if (process.env.NODE_ENV !== 'production') {
-      console.info(`[PGDesk Auth] Email change verification code for user #${dbUser.id}: ${code}`);
-    }
-
     return res.json({
       ok: true,
       pendingEmail: nextEmail,
@@ -316,12 +371,15 @@ accountRouter.post('/email-change/request', requireAuth, async (req: AuthRequest
     });
   } catch (err) {
     console.error('POST /api/account/email-change/request error:', err);
-    return res.status(500).json({ error: 'Failed to start email change verification' });
+    return res.status(500).json({ error: 'Failed to update email address' });
   }
 });
 
 accountRouter.post('/email-change/confirm', requireAuth, async (req: AuthRequest, res) => {
   try {
+    if (!isEmailVerificationEnabled()) {
+      return res.status(410).json({ error: 'Email verification is disabled during testing.' });
+    }
     const authUser = req.user!;
     const parsed = confirmCodeSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -375,51 +433,140 @@ accountRouter.post('/email-change/confirm', requireAuth, async (req: AuthRequest
   }
 });
 
-accountRouter.patch('/phone', requireAuth, async (req: AuthRequest, res) => {
+accountRouter.post('/phone-change/request', requireAuth, async (req: AuthRequest, res) => {
   try {
     const authUser = req.user!;
-    const parsed = updateDirectPhoneSchema.safeParse(req.body);
+    if (!checkRateLimit(`chg-phone:${authUser.id}`, 8, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many mobile change requests. Try again shortly.' });
+    }
+
+    const parsed = requestPhoneChangeSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid mobile number' });
     }
 
-    const nextPhone = normalizePhone10(parsed.data.phone);
+    const nextPhone = normalizePhone10(parsed.data.newPhone);
+    const [dbUser] = await db.select().from(schema.users).where(eq(schema.users.id, authUser.id)).limit(1);
+    if (!dbUser) return res.status(404).json({ error: 'Account not found' });
+
+    if (dbUser.passwordHash && !verifyPassword(parsed.data.currentPassword || '', dbUser.passwordHash)) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+    if (nextPhone === normalizePhone10(dbUser.phone || '')) {
+      return res.status(400).json({ error: 'New mobile number is the same as your current number' });
+    }
+
+    if (!isSmsOtpEnabled()) {
+      await db
+        .update(schema.users)
+        .set({
+          phone: nextPhone,
+          pendingPhone: null,
+          pendingPhoneCodeHash: null,
+          pendingPhoneExpiresAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.users.id, dbUser.id));
+
+      if (dbUser.role === 'TENANT') {
+        await db
+          .update(schema.tenants)
+          .set({ phone: nextPhone, updatedAt: new Date() })
+          .where(and(eq(schema.tenants.userId, dbUser.id), isNull(schema.tenants.deletedAt)));
+      }
+
+      await logAudit({
+        user: authUser,
+        action: 'PHONE_CHANGED',
+        entityType: 'USER',
+        entityId: dbUser.id,
+        metadata: { newPhone: nextPhone },
+      });
+
+      return res.json({
+        ok: true,
+        directUpdate: true,
+        phone: nextPhone,
+        message: 'Mobile number updated.',
+      });
+    }
+
+    const code = generateSixDigitOtp();
     await db
       .update(schema.users)
       .set({
-        phone: nextPhone,
-        phoneVerified: false,
+        pendingPhone: nextPhone,
+        pendingPhoneCodeHash: hashToken(code),
+        pendingPhoneExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.users.id, dbUser.id));
+
+    return res.json({
+      ok: true,
+      pendingPhone: nextPhone,
+      message: `A 6-digit verification code has been sent to +91 ${nextPhone}. Enter it below to confirm your new number.`,
+    });
+  } catch (err) {
+    console.error('POST /api/account/phone-change/request error:', err);
+    return res.status(500).json({ error: 'Failed to update mobile number' });
+  }
+});
+
+accountRouter.post('/phone-change/confirm', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    if (!isSmsOtpEnabled()) {
+      return res.status(410).json({ error: 'SMS OTP verification is disabled during testing.' });
+    }
+    const authUser = req.user!;
+    const parsed = confirmCodeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Enter the 6-digit code' });
+    }
+
+    const [dbUser] = await db.select().from(schema.users).where(eq(schema.users.id, authUser.id)).limit(1);
+    if (
+      !dbUser ||
+      !dbUser.pendingPhone ||
+      !dbUser.pendingPhoneCodeHash ||
+      !dbUser.pendingPhoneExpiresAt ||
+      dbUser.pendingPhoneExpiresAt.getTime() < Date.now() ||
+      !verifyTokenHash(parsed.data.code, dbUser.pendingPhoneCodeHash)
+    ) {
+      return res.status(400).json({ error: 'Invalid or expired verification code' });
+    }
+
+    const newPhone = dbUser.pendingPhone;
+    await db
+      .update(schema.users)
+      .set({
+        phone: newPhone,
         pendingPhone: null,
         pendingPhoneCodeHash: null,
         pendingPhoneExpiresAt: null,
         updatedAt: new Date(),
       })
-      .where(eq(schema.users.id, authUser.id));
+      .where(eq(schema.users.id, dbUser.id));
 
-    if (authUser.role === 'TENANT') {
+    if (dbUser.role === 'TENANT') {
       await db
         .update(schema.tenants)
-        .set({ phone: nextPhone, updatedAt: new Date() })
-        .where(and(eq(schema.tenants.userId, authUser.id), isNull(schema.tenants.deletedAt)));
+        .set({ phone: newPhone, updatedAt: new Date() })
+        .where(and(eq(schema.tenants.userId, dbUser.id), isNull(schema.tenants.deletedAt)));
     }
 
     await logAudit({
       user: authUser,
-      action: 'PHONE_UPDATED',
+      action: 'PHONE_CHANGED',
       entityType: 'USER',
-      entityId: authUser.id,
-      metadata: { phoneVerified: false },
+      entityId: dbUser.id,
+      metadata: { newPhone },
     });
 
-    return res.json({
-      ok: true,
-      phone: nextPhone,
-      phoneVerified: false,
-      message: 'Mobile number updated (stored as unverified contact number).',
-    });
+    return res.json({ ok: true, phone: newPhone, message: 'Mobile number verified and updated.' });
   } catch (err) {
-    console.error('PATCH /api/account/phone error:', err);
-    return res.status(500).json({ error: 'Failed to update mobile number' });
+    console.error('POST /api/account/phone-change/confirm error:', err);
+    return res.status(500).json({ error: 'Failed to verify new mobile number' });
   }
 });
 
@@ -475,7 +622,17 @@ accountRouter.post('/sessions/revoke-others', requireAuth, async (req: AuthReque
         .where(and(eq(schema.userSessions.userId, dbUser.id), isNull(schema.userSessions.revokedAt)));
     }
 
-    const sessionResult = await issueUserSession(req, res, updatedUser, req.sessionId);
+    const sessionResult = await issueUserSession(
+      req,
+      res,
+      {
+        id: updatedUser.id,
+        organizationId: updatedUser.organizationId,
+        role: authUser.role,
+        tokenVersion: updatedUser.tokenVersion ?? 1,
+      },
+      req.sessionId
+    );
 
     await logAudit({
       user: authUser,

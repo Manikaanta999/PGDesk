@@ -1,4 +1,4 @@
-export type InvoiceStatusCode = 'PAID' | 'PENDING' | 'OVERDUE' | 'PARTIAL';
+export type InvoiceStatusCode = 'PAID' | 'PENDING' | 'UNPAID' | 'OVERDUE' | 'PARTIAL';
 export type TenantStatusCode = 'ACTIVE' | 'NOTICE' | 'LEFT';
 export type BedStatusCode = 'VACANT' | 'OCCUPIED' | 'RESERVED' | 'MAINTENANCE';
 export type ComplaintStatusCode = 'OPEN' | 'IN_PROGRESS' | 'RESOLVED';
@@ -10,15 +10,16 @@ export type EnquiryStageCode =
   | 'CONVERTED_TO_STUDENT';
 
 export function formatInvoiceStatus(status: string): string {
-  switch (status) {
+  switch (String(status || '').toUpperCase()) {
     case 'PAID':
       return 'Paid';
     case 'PARTIAL':
       return 'Partially Paid';
     case 'OVERDUE':
       return 'Overdue';
+    case 'UNPAID':
     case 'PENDING':
-      return 'Pending';
+      return 'Unpaid';
     default:
       return status;
   }

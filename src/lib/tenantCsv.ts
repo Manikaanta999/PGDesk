@@ -15,6 +15,8 @@ export interface TenantCsvRow {
   securityDeposit: number;
   joinDate: string;
   balanceDue: number;
+  invoiceCount?: number;
+  rentStatus?: string;
   occupation: string;
   companyOrCollege: string;
 }
@@ -27,7 +29,11 @@ function sanitizeCsvValue(value: string | null | undefined): string {
   return FORMULA_PREFIX_RE.test(str) ? `'${str}` : str;
 }
 
-export function formatTenantPaymentStatus(balanceDue: number): 'Paid' | 'Pending Dues' {
+export function formatTenantPaymentStatus(
+  balanceDue: number,
+  hasInvoices: boolean = true
+): 'Paid' | 'Pending Dues' | 'Unpaid' {
+  if (!hasInvoices) return 'Unpaid';
   return Number.isFinite(balanceDue) && balanceDue > 0 ? 'Pending Dues' : 'Paid';
 }
 
@@ -70,7 +76,7 @@ export function buildTenantsCsv(tenants: TenantCsvRow[]): string {
       'Room Number': sanitizeCsvValue(t.roomNumber || 'Unassigned'),
       Bed: sanitizeCsvValue(t.bedLabel || 'Unassigned'),
       'Tenant Status': t.status,
-      'Payment Status': formatTenantPaymentStatus(dueBalance),
+      'Payment Status': formatTenantPaymentStatus(dueBalance, (t.invoiceCount ?? 1) > 0),
       'Due Balance (INR)': dueBalance,
       'Monthly Rent (INR)': monthlyRent,
       'Security Deposit (INR)': securityDeposit,

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
+import { reconcileInvoiceWithPayments } from '../../lib/billing.ts';
 import { formatMonthYear } from '../../lib/format.ts';
 import { AuthRequest, getAllowedPropertyIds, requireAuth, requireRole } from '../../middleware/auth.ts';
 
@@ -113,9 +114,29 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
     const occupancyPct = totalBeds > 0 ? Math.round((occupiedBeds / totalBeds) * 100) : 0;
     const totalStudents = allTenants.filter((t) => t.status === 'ACTIVE' || t.status === 'NOTICE').length;
 
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const paymentsByInvoice = new Map<number, typeof allPayments>();
+    for (const p of allPayments) {
+      if (p.approvalStatus === 'APPROVED') {
+        const arr = paymentsByInvoice.get(p.invoiceId) ?? [];
+        arr.push(p);
+        paymentsByInvoice.set(p.invoiceId, arr);
+      }
+    }
+
+    const reconciledInvoices = allInvoices.map((inv) => {
+      const reconciled = reconcileInvoiceWithPayments(inv, paymentsByInvoice.get(inv.id) ?? [], todayStr);
+      return {
+        ...inv,
+        reconciledPaidAmount: reconciled.paidAmount,
+        reconciledBalanceDue: reconciled.balanceDue,
+        reconciledStatus: reconciled.status,
+      };
+    });
+
     // Determine current period based on latest invoice period or current calendar date
     const now = new Date();
-    const latestPeriod = allInvoices.reduce(
+    const latestPeriod = reconciledInvoices.reduce(
       (acc, inv) => {
         if (inv.periodYear > acc.year || (inv.periodYear === acc.year && inv.periodMonth > acc.month)) {
           return { year: inv.periodYear, month: inv.periodMonth };
@@ -125,18 +146,20 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
       { year: now.getFullYear(), month: now.getMonth() + 1 }
     );
 
-    const currentMonthInvoices = allInvoices.filter(
+    const currentMonthInvoices = reconciledInvoices.filter(
       (inv) => inv.periodYear === latestPeriod.year && inv.periodMonth === latestPeriod.month
     );
-    const collectedThisMonth = currentMonthInvoices.reduce((sum, inv) => sum + inv.paidAmount, 0);
-    const pendingThisMonth = currentMonthInvoices.reduce(
-      (sum, inv) => sum + Math.max(0, inv.amount - inv.paidAmount),
-      0
-    );
+    // Count only genuine APPROVED recorded payments as collected rent
+    const collectedThisMonth = currentMonthInvoices.reduce((sum, inv) => sum + inv.reconciledPaidAmount, 0);
+    // Include all outstanding unpaid balances across open invoices
+    const pendingThisMonth = reconciledInvoices.reduce((sum, inv) => sum + inv.reconciledBalanceDue, 0);
 
+    const activeInvIds = new Set(allInvoices.map((i) => i.id));
     const openComplaints = allComplaints.filter((c) => c.status !== 'RESOLVED').length;
     const newLeads = allEnquiries.filter((e) => e.status === 'NEW_ENQUIRY').length;
-    const pendingUpiApprovals = allPayments.filter((p) => p.approvalStatus === 'PENDING_APPROVAL').length;
+    const pendingUpiApprovals = allPayments.filter(
+      (p) => p.approvalStatus === 'PENDING_APPROVAL' && activeInvIds.has(p.invoiceId)
+    ).length;
 
     // 6-month revenue & expense series
     const monthBuckets: Array<{ year: number; month: number }> = [];
@@ -147,9 +170,10 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
 
     const revenueSeries = monthBuckets.map(({ year, month }) => {
       const mStr = `${year}-${String(month).padStart(2, '0')}`;
-      const mInvs = allInvoices.filter((i) => i.periodYear === year && i.periodMonth === month);
-      const collected = mInvs.reduce((s, i) => s + i.paidAmount, 0);
+      const mInvs = reconciledInvoices.filter((i) => i.periodYear === year && i.periodMonth === month);
+      const collected = mInvs.reduce((s, i) => s + i.reconciledPaidAmount, 0);
       const billed = mInvs.reduce((s, i) => s + i.amount, 0);
+      const pending = mInvs.reduce((s, i) => s + i.reconciledBalanceDue, 0);
       const expense = allExpenses
         .filter((e) => e.expenseDate.startsWith(mStr))
         .reduce((s, e) => s + e.amount, 0);
@@ -157,7 +181,7 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
         label: formatMonthYear(month, year),
         billed,
         collected,
-        pending: Math.max(0, billed - collected),
+        pending,
         expense,
       };
     });
@@ -167,9 +191,9 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
     const bedMap = new Map(allBeds.map((b) => [b.id, b]));
     const roomMap = new Map(allRooms.map((r) => [r.id, r]));
 
-    const statusOrder: Record<string, number> = { OVERDUE: 0, PARTIAL: 1, PENDING: 2 };
-    const unpaidInvoices = allInvoices
-      .filter((inv) => inv.status !== 'PAID' && inv.amount - inv.paidAmount > 0)
+    const statusOrder: Record<string, number> = { OVERDUE: 0, PARTIAL: 1, UNPAID: 2, PENDING: 2 };
+    const unpaidInvoices = reconciledInvoices
+      .filter((inv) => inv.reconciledStatus !== 'PAID' && inv.reconciledBalanceDue > 0)
       .map((inv) => {
         const t = tenantMap.get(inv.tenantId);
         const p = propMap.get(inv.propertyId);
@@ -185,8 +209,8 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
           roomNumber: room?.roomNumber || '',
           bedLabel: bed?.bedLabel || '',
           dueDate: inv.dueDate,
-          balanceDue: Math.max(0, inv.amount - inv.paidAmount),
-          status: inv.status,
+          balanceDue: inv.reconciledBalanceDue,
+          status: inv.reconciledStatus,
           periodLabel: formatMonthYear(inv.periodMonth, inv.periodYear),
         };
       })

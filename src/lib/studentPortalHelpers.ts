@@ -1,4 +1,4 @@
-export type StudentOverallRentStatus = 'Paid' | 'Pending' | 'Partially Paid' | 'Overdue';
+export type StudentOverallRentStatus = 'Paid' | 'Unpaid' | 'Partially Paid' | 'Overdue';
 
 export interface StudentInvoiceLike {
   amount: number;
@@ -17,22 +17,23 @@ export interface StudentRentSummary {
 
 export function deriveStudentRentSummary(
   invoices: StudentInvoiceLike[],
-  monthlyRent: number
+  monthlyRent: number,
+  asOfDate: string = new Date().toISOString().slice(0, 10)
 ): StudentRentSummary {
   if (!invoices || invoices.length === 0) {
     return {
       monthlyRent,
       amountPaid: 0,
-      pendingAmount: 0,
+      pendingAmount: Math.max(0, Math.round(monthlyRent)),
       nextDueDate: null,
-      overallStatus: 'Paid',
+      overallStatus: 'Unpaid',
     };
   }
 
   let pendingAmount = 0;
   let hasOverdue = false;
   let hasPartial = false;
-  let hasPending = false;
+  let hasUnpaid = false;
   let earliestDueDate: string | null = null;
 
   for (const inv of invoices) {
@@ -42,12 +43,12 @@ export function deriveStudentRentSummary(
       if (!earliestDueDate || inv.dueDate < earliestDueDate) {
         earliestDueDate = inv.dueDate;
       }
-      if (inv.status === 'OVERDUE') {
+      if (inv.status === 'OVERDUE' || (inv.dueDate && asOfDate > inv.dueDate)) {
         hasOverdue = true;
       } else if (inv.status === 'PARTIAL' || inv.paidAmount > 0) {
         hasPartial = true;
       } else {
-        hasPending = true;
+        hasUnpaid = true;
       }
     }
   }
@@ -61,8 +62,8 @@ export function deriveStudentRentSummary(
     overallStatus = 'Overdue';
   } else if (hasPartial) {
     overallStatus = 'Partially Paid';
-  } else if (hasPending || pendingAmount > 0) {
-    overallStatus = 'Pending';
+  } else if (hasUnpaid || pendingAmount > 0) {
+    overallStatus = 'Unpaid';
   }
 
   return {
@@ -169,10 +170,11 @@ export function formatStudentInvoiceStatus(status: string | null | undefined): s
       return 'Partially Paid';
     case 'OVERDUE':
       return 'Overdue';
+    case 'UNPAID':
     case 'PENDING':
-      return 'Pending';
+      return 'Unpaid';
     default:
-      return String(status || 'Pending');
+      return String(status || 'Unpaid');
   }
 }
 

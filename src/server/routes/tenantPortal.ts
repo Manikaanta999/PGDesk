@@ -1,6 +1,11 @@
 import { Router } from 'express';
 import { and, desc, eq, gt, inArray, isNull, ne, or } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
+import {
+  canDownloadInvoiceReceipt,
+  computeApprovedPaidAmount,
+  reconcileInvoiceWithPayments,
+} from '../../lib/billing.ts';
 import { formatDateIN, formatMonthYear } from '../../lib/format.ts';
 import { generateReceiptPdfBytes } from '../../lib/pdfReceipt.ts';
 import {
@@ -88,19 +93,30 @@ async function buildPastStaysPayload(pastTenants: Array<typeof schema.tenants.$i
   const propMap = new Map(pastProps.map((p) => [p.id, p]));
   const bedMap = new Map(pastBeds.map((b) => [b.id, b]));
   const roomMap = new Map(pastRooms.map((r) => [r.id, r]));
+  const todayStr = new Date().toISOString().slice(0, 10);
 
   return pastTenants.map((t) => {
     const prop = propMap.get(t.propertyId);
     const bed = t.bedId ? bedMap.get(t.bedId) : undefined;
     const room = bed ? roomMap.get(bed.roomId) : undefined;
+    const stayPayments = pastPayments.filter((p) => p.tenantId === t.id);
     const stayInvoices = pastInvoices
       .filter((i) => i.tenantId === t.id)
-      .map((i) => ({
-        ...i,
-        periodLabel: formatMonthYear(i.periodMonth, i.periodYear),
-        balanceDue: Math.max(0, i.amount - i.paidAmount),
-      }));
-    const stayPayments = pastPayments.filter((p) => p.tenantId === t.id);
+      .map((i) => {
+        const reconciled = reconcileInvoiceWithPayments(
+          i,
+          stayPayments.filter((p) => p.invoiceId === i.id),
+          todayStr
+        );
+        return {
+          ...i,
+          paidAmount: reconciled.paidAmount,
+          status: reconciled.status,
+          balanceDue: reconciled.balanceDue,
+          approvedPaymentCount: reconciled.approvedCount,
+          periodLabel: formatMonthYear(i.periodMonth, i.periodYear),
+        };
+      });
 
     return {
       stayId: t.id,
@@ -307,11 +323,22 @@ tenantPortalRouter.get('/overview', requireAuth, requireRole('TENANT'), async (r
         : null,
       bed,
       room,
-      invoices: tenantInvoices.map((i) => ({
-        ...i,
-        periodLabel: formatMonthYear(i.periodMonth, i.periodYear),
-        balanceDue: Math.max(0, i.amount - i.paidAmount),
-      })),
+      invoices: tenantInvoices.map((i) => {
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const reconciled = reconcileInvoiceWithPayments(
+          i,
+          tenantPayments.filter((p) => p.invoiceId === i.id),
+          todayStr
+        );
+        return {
+          ...i,
+          paidAmount: reconciled.paidAmount,
+          status: reconciled.status,
+          balanceDue: reconciled.balanceDue,
+          approvedPaymentCount: reconciled.approvedCount,
+          periodLabel: formatMonthYear(i.periodMonth, i.periodYear),
+        };
+      }),
       payments: tenantPayments,
       complaints: tenantComplaints.map((c) => ({
         ...c,
@@ -425,43 +452,109 @@ tenantPortalRouter.post('/payments', requireAuth, requireRole('TENANT'), async (
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid UPI submission' });
     }
 
-    const [invoice] = await db
-      .select()
-      .from(schema.invoices)
-      .where(
-        and(
-          eq(schema.invoices.id, parsed.data.invoiceId),
-          eq(schema.invoices.tenantId, tenant.id),
-          eq(schema.invoices.organizationId, tenant.organizationId)
-        )
-      )
-      .limit(1);
+    const d = parsed.data;
+    const result = await db.transaction(async (tx) => {
+      if (d.idempotencyKey) {
+        const [dupByKey] = await tx
+          .select({ id: schema.payments.id })
+          .from(schema.payments)
+          .where(
+            and(
+              eq(schema.payments.organizationId, tenant.organizationId),
+              eq(schema.payments.idempotencyKey, d.idempotencyKey)
+            )
+          )
+          .limit(1);
+        if (dupByKey) {
+          return { errorStatus: 409 as const, error: 'Duplicate payment proof submission detected.' };
+        }
+      }
 
-    if (!invoice) {
-      return res.status(404).json({ error: 'Invoice not found for your account' });
+      const [invoice] = await tx
+        .select()
+        .from(schema.invoices)
+        .where(
+          and(
+            eq(schema.invoices.id, d.invoiceId),
+            eq(schema.invoices.tenantId, tenant.id),
+            eq(schema.invoices.organizationId, tenant.organizationId)
+          )
+        )
+        .for('update')
+        .limit(1);
+
+      if (!invoice) {
+        return { errorStatus: 404 as const, error: 'Invoice not found for your account' };
+      }
+
+      const invPayments = await tx
+        .select()
+        .from(schema.payments)
+        .where(
+          and(
+            eq(schema.payments.invoiceId, invoice.id),
+            eq(schema.payments.organizationId, tenant.organizationId)
+          )
+        );
+
+      const paidAmount = computeApprovedPaidAmount(invPayments);
+      const balanceDue = Math.max(0, invoice.amount - paidAmount);
+      if (balanceDue <= 0) {
+        return { errorStatus: 400 as const, error: 'This invoice has already been paid in full.' };
+      }
+      if (d.amount > balanceDue) {
+        return {
+          errorStatus: 400 as const,
+          error: `Submitted amount exceeds remaining balance of ₹${balanceDue.toLocaleString('en-IN')}.`,
+        };
+      }
+
+      const normalizedRef = d.reference.trim().toLowerCase();
+      const dupUtr = invPayments.some(
+        (p) =>
+          (p.approvalStatus === 'PENDING_APPROVAL' || p.approvalStatus === 'APPROVED') &&
+          p.reference.trim().toLowerCase() === normalizedRef
+      );
+      if (dupUtr) {
+        return {
+          errorStatus: 409 as const,
+          error: 'This UPI/UTR reference has already been submitted for this invoice.',
+        };
+      }
+
+      // Strictly record as PENDING_APPROVAL: students can never mark their own invoices as PAID
+      const [payment] = await tx
+        .insert(schema.payments)
+        .values({
+          organizationId: tenant.organizationId,
+          invoiceId: invoice.id,
+          tenantId: tenant.id,
+          amount: d.amount,
+          method: 'UPI',
+          reference: d.reference,
+          screenshotUrl: d.screenshotUrl || null,
+          approvalStatus: 'PENDING_APPROVAL',
+          paidAt: new Date().toISOString().slice(0, 10),
+          idempotencyKey: d.idempotencyKey || null,
+          notes: d.notes || 'Submitted by resident via Student Portal',
+        })
+        .returning();
+
+      return { payment };
+    });
+
+    if ('errorStatus' in result && result.errorStatus) {
+      return res.status(result.errorStatus).json({ error: result.error });
     }
 
-    const [payment] = await db
-      .insert(schema.payments)
-      .values({
-        organizationId: tenant.organizationId,
-        invoiceId: invoice.id,
-        tenantId: tenant.id,
-        amount: parsed.data.amount,
-        method: 'UPI',
-        reference: parsed.data.reference,
-        screenshotUrl: parsed.data.screenshotUrl || null,
-        approvalStatus: 'PENDING_APPROVAL',
-        paidAt: new Date().toISOString().slice(0, 10),
-        notes: parsed.data.notes || 'Submitted by resident via Student Portal',
-      })
-      .returning();
-
     return res.status(201).json({
-      payment,
+      payment: result.payment,
       message: 'UPI payment proof submitted for owner verification.',
     });
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.code === '23505' || err?.cause?.code === '23505') {
+      return res.status(409).json({ error: 'Duplicate payment proof submission prevented.' });
+    }
     console.error('POST /api/tenant/payments error:', err);
     return res.status(500).json({ error: 'Failed to submit payment proof' });
   }
@@ -648,6 +741,14 @@ tenantPortalRouter.get('/invoices/:id/receipt.pdf', requireAuth, requireRole('TE
         .where(and(eq(schema.payments.invoiceId, invoice.id), eq(schema.payments.approvalStatus, 'APPROVED'))),
     ]);
 
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const reconciled = reconcileInvoiceWithPayments(invoice, invPayments, todayStr);
+    if (!canDownloadInvoiceReceipt({ paidAmount: reconciled.paidAmount, approvedCount: reconciled.approvedCount })) {
+      return res.status(400).json({
+        error: 'Receipt cannot be downloaded because no verified payment has been recorded for this invoice yet.',
+      });
+    }
+
     const org = orgRows[0];
     const prop = propRows[0];
     let roomBedLabel = 'Assigned Bed';
@@ -670,13 +771,13 @@ tenantPortalRouter.get('/invoices/:id/receipt.pdf', requireAuth, requireRole('TE
       periodLabel: formatMonthYear(invoice.periodMonth, invoice.periodYear),
       issuedDate: formatDateIN(invoice.createdAt),
       dueDate: formatDateIN(invoice.dueDate),
-      status: invoice.status,
+      status: reconciled.status,
       tenantName: stayTenant.name,
       tenantPhone: stayTenant.phone || stayTenant.email || 'Not provided',
       roomBedLabel,
       items: invoice.items,
       totalAmount: invoice.amount,
-      paidAmount: invoice.paidAmount,
+      paidAmount: reconciled.paidAmount,
       payments: invPayments.map((p) => ({
         paidAt: formatDateIN(p.paidAt),
         method: p.method,

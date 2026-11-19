@@ -1,19 +1,23 @@
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index.ts';
 import {
+  addDaysYmd,
   calculateGstBreakdown,
   calculateProRataRent,
   computeLateFee,
-  deriveInvoiceStatus,
   formatFyInvoiceNumber,
+  reconcileInvoiceWithPayments,
 } from '../lib/billing.ts';
+
+type DbExecutor = Pick<typeof db, 'select' | 'insert' | 'update'>;
 
 export async function allocateNextFyInvoiceNumber(
   organizationId: number,
   year: number,
-  month: number
+  month: number,
+  executor: DbExecutor = db
 ): Promise<string> {
-  const [updated] = await db
+  const [updated] = await executor
     .update(schema.organizations)
     .set({
       invoiceSeq: sql`${schema.organizations.invoiceSeq} + 1`,
@@ -60,7 +64,7 @@ export async function runBillingCycleForOrg(
   }
 
   const propMap = new Map(orgProps.map((p) => [p.id, p]));
-  const [activeTenants, existingPeriodInvoices, openInvoices] = await Promise.all([
+  const [activeTenants, existingPeriodInvoices, openInvoices, orgApprovedPayments] = await Promise.all([
     db
       .select()
       .from(schema.tenants)
@@ -90,28 +94,38 @@ export async function runBillingCycleForOrg(
           inArray(schema.invoices.propertyId, allowedIds)
         )
       ),
+    db
+      .select()
+      .from(schema.payments)
+      .where(
+        and(
+          eq(schema.payments.organizationId, org.id),
+          eq(schema.payments.approvalStatus, 'APPROVED')
+        )
+      ),
   ]);
+
+  const approvedByInvoice = new Map<number, typeof orgApprovedPayments>();
+  for (const p of orgApprovedPayments) {
+    const arr = approvedByInvoice.get(p.invoiceId) ?? [];
+    arr.push(p);
+    approvedByInvoice.set(p.invoiceId, arr);
+  }
 
   let updatedOverdueCount = 0;
   for (const inv of openInvoices) {
-    if (inv.status === 'PAID') continue;
-    const balance = Math.max(0, inv.amount - inv.paidAmount);
-    const nextStatus = deriveInvoiceStatus({
-      amount: inv.amount,
-      paidAmount: inv.paidAmount,
-      dueDate: inv.dueDate,
-      asOfDate,
-    });
+    const invPayments = approvedByInvoice.get(inv.id) ?? [];
+    const reconciled = reconcileInvoiceWithPayments(inv, invPayments, asOfDate);
 
     const items = [...inv.items];
     let nextAmount = inv.amount;
-    if (applyLateFees && nextStatus === 'OVERDUE' && !items.some((it) => it.type === 'LATE_FEE')) {
+    if (applyLateFees && reconciled.status === 'OVERDUE' && !items.some((it) => it.type === 'LATE_FEE')) {
       const fee = computeLateFee({
         dueDate: inv.dueDate,
         asOfDate,
         graceDays: org.graceDays,
         lateFeePerDay: org.lateFeePerDay,
-        balanceDue: balance,
+        balanceDue: reconciled.balanceDue,
       });
       if (fee > 0) {
         items.push({ label: 'Late Payment Fee', type: 'LATE_FEE', amount: fee });
@@ -119,10 +133,25 @@ export async function runBillingCycleForOrg(
       }
     }
 
-    if (nextStatus !== inv.status || nextAmount !== inv.amount) {
+    const finalReconciled =
+      nextAmount !== inv.amount
+        ? reconcileInvoiceWithPayments({ amount: nextAmount, dueDate: inv.dueDate }, invPayments, asOfDate)
+        : reconciled;
+
+    if (
+      finalReconciled.status !== inv.status ||
+      finalReconciled.paidAmount !== inv.paidAmount ||
+      nextAmount !== inv.amount
+    ) {
       await db
         .update(schema.invoices)
-        .set({ status: nextStatus, items, amount: nextAmount, updatedAt: new Date() })
+        .set({
+          status: finalReconciled.status,
+          paidAmount: finalReconciled.paidAmount,
+          items,
+          amount: nextAmount,
+          updatedAt: new Date(),
+        })
         .where(eq(schema.invoices.id, inv.id));
       updatedOverdueCount += 1;
     }
@@ -160,8 +189,8 @@ export async function runBillingCycleForOrg(
 
     if (calc.amount <= 0) continue;
 
-    const dueDay = Math.min(28, billingTriggerDay + (org.dueDaysAfterInvoice ?? 5));
-    const dueDate = `${year}-${mStr}-${String(dueDay).padStart(2, '0')}`;
+    const billingDate = `${year}-${mStr}-${String(billingTriggerDay).padStart(2, '0')}`;
+    const dueDate = addDaysYmd(billingDate, org.dueDaysAfterInvoice ?? 5);
     const invNum = await allocateNextFyInvoiceNumber(org.id, year, month);
 
     const gst = calculateGstBreakdown(calc.amount, org.gstRatePct ?? 0);
@@ -194,7 +223,7 @@ export async function runBillingCycleForOrg(
       amount: gst.totalWithGst,
       paidAmount: 0,
       dueDate,
-      status: asOfDate > dueDate ? 'OVERDUE' : 'PENDING',
+      status: asOfDate > dueDate ? 'OVERDUE' : 'UNPAID',
       isProRata: calc.isProRata,
     });
     createdCount += 1;

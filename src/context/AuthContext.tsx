@@ -1,6 +1,8 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut } from 'firebase/auth';
-import { apiFetch, setStoredToken } from '../lib/api';
+import { ApiError, apiFetch, getStoredToken, setStoredToken } from '../lib/api';
+import { AuthTestingPolicy, FORGOT_PASSWORD_UNAVAILABLE_MESSAGE } from '../lib/authPolicy';
+import { AppUserRole } from '../lib/authRoles';
 import { auth, googleAuthProvider } from '../lib/firebase';
 
 export interface SessionUser {
@@ -10,7 +12,7 @@ export interface SessionUser {
   email: string;
   phone: string | null;
   photoUrl?: string | null;
-  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+  role: AppUserRole;
   assignedPropertyIds: number[];
 }
 
@@ -38,26 +40,33 @@ export interface SessionOrg {
 
 export interface RegisterInput {
   accountType: 'OWNER' | 'TENANT';
-  ownerRegistrationToken?: string;
   name: string;
   organizationName?: string;
   email: string;
-  phone?: string;
+  phone: string;
   password: string;
 }
 
 export interface RegisterResult {
   user?: SessionUser;
-  requiresEmailVerification?: boolean;
+  requiresOtp?: boolean;
   email?: string;
   message?: string;
 }
+
+const DEFAULT_AUTH_POLICY: AuthTestingPolicy = {
+  emailVerificationEnabled: false,
+  smsOtpEnabled: false,
+  passwordResetEmailEnabled: false,
+  forgotPasswordMessage: FORGOT_PASSWORD_UNAVAILABLE_MESSAGE,
+};
 
 interface AuthContextValue {
   user: SessionUser | null;
   organization: SessionOrg | null;
   demoModeEnabled: boolean;
   googleAuthEnabled: boolean;
+  authPolicy: AuthTestingPolicy;
   loading: boolean;
   darkMode: boolean;
   toggleDarkMode: () => void;
@@ -65,10 +74,9 @@ interface AuthContextValue {
   applySessionToken: (token?: string, cookieOnly?: boolean) => void;
   loginWithCredentials: (identifier: string, password: string) => Promise<SessionUser>;
   registerAccount: (input: RegisterInput) => Promise<RegisterResult>;
-  verifyEmail: (email: string, code: string) => Promise<SessionUser>;
-  resendVerification: (email: string) => Promise<{ ok: boolean; message: string }>;
-  forgotPassword: (email: string) => Promise<{ ok: boolean; message: string }>;
-  resetPassword: (payload: { email: string; code: string; newPassword: string }) => Promise<{ ok: boolean; message: string }>;
+  verifyTenantOtp: (email: string, otp: string) => Promise<SessionUser>;
+  forgotPassword: (identifier: string) => Promise<{ ok: boolean; message: string }>;
+  resetPassword: (payload: { identifier: string; code: string; newPassword: string }) => Promise<{ ok: boolean; message: string }>;
   loginDemo: (role: 'OWNER' | 'MANAGER' | 'TENANT') => Promise<SessionUser>;
   loginWithGoogle: () => Promise<SessionUser | null>;
   logout: () => Promise<void>;
@@ -79,6 +87,7 @@ const AuthContext = createContext<AuthContextValue>({
   organization: null,
   demoModeEnabled: false,
   googleAuthEnabled: false,
+  authPolicy: DEFAULT_AUTH_POLICY,
   loading: true,
   darkMode: false,
   toggleDarkMode: () => {},
@@ -90,10 +99,7 @@ const AuthContext = createContext<AuthContextValue>({
   registerAccount: async () => {
     throw new Error('AuthProvider not mounted');
   },
-  verifyEmail: async () => {
-    throw new Error('AuthProvider not mounted');
-  },
-  resendVerification: async () => {
+  verifyTenantOtp: async () => {
     throw new Error('AuthProvider not mounted');
   },
   forgotPassword: async () => {
@@ -113,7 +119,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [organization, setOrganization] = useState<SessionOrg | null>(null);
   const [demoModeEnabled, setDemoModeEnabled] = useState<boolean>(false);
+  const [authPolicy, setAuthPolicy] = useState<AuthTestingPolicy>(DEFAULT_AUTH_POLICY);
   const [loading, setLoading] = useState(true);
+  const manualAuthBusyRef = useRef(false);
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window === 'undefined') return false;
     return localStorage.getItem('pgdesk_theme') === 'dark';
@@ -134,20 +142,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setDarkMode((d) => !d);
   }, []);
 
-  const refreshSession = useCallback(async (): Promise<SessionUser | null> => {
+  const refreshSession = useCallback(async (throwOnProfileError = false): Promise<SessionUser | null> => {
     try {
       const data = await apiFetch<{
         user: SessionUser | null;
         organization?: SessionOrg | null;
         demoModeEnabled?: boolean;
+        authPolicy?: AuthTestingPolicy;
       }>('/api/auth/me');
       setUser(data.user);
       setOrganization(data.organization ?? null);
       setDemoModeEnabled(Boolean(data.demoModeEnabled));
+      if (data.authPolicy) {
+        setAuthPolicy(data.authPolicy);
+      }
       return data.user;
-    } catch {
+    } catch (err) {
       setUser(null);
       setOrganization(null);
+      if (throwOnProfileError) {
+        throw err;
+      }
       return null;
     } finally {
       setLoading(false);
@@ -155,11 +170,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    refreshSession();
+    void refreshSession();
     if (!auth) return;
     const unsub = onAuthStateChanged(auth, (fbUser) => {
-      if (fbUser) {
-        refreshSession();
+      if (fbUser && !manualAuthBusyRef.current && !getStoredToken()) {
+        void refreshSession();
       }
     });
     return () => unsub();
@@ -186,19 +201,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const loginWithCredentials = useCallback(
     async (identifier: string, password: string): Promise<SessionUser> => {
-      if (auth?.currentUser) {
-        await firebaseSignOut(auth).catch(() => {});
+      manualAuthBusyRef.current = true;
+      try {
+        if (auth?.currentUser) {
+          await firebaseSignOut(auth).catch(() => {});
+        }
+        const normalizedIdentifier = identifier.trim();
+        const res = await apiFetch<{
+          user: SessionUser;
+          organization?: SessionOrg | null;
+          token?: string;
+          cookieOnly?: boolean;
+        }>('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ identifier: normalizedIdentifier, password }),
+        });
+        if (!res.user || !res.organization) {
+          throw new ApiError(
+            'Login successful, but your account profile could not be loaded. Please contact support.',
+            500,
+            { code: 'PROFILE_LOAD_FAILED' }
+          );
+        }
+        return applyAuthResult(res);
+      } finally {
+        manualAuthBusyRef.current = false;
       }
-      const res = await apiFetch<{
-        user: SessionUser;
-        organization?: SessionOrg | null;
-        token?: string;
-        cookieOnly?: boolean;
-      }>('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ identifier, password }),
-      });
-      return applyAuthResult(res);
     },
     [applyAuthResult]
   );
@@ -213,16 +241,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         organization?: SessionOrg | null;
         token?: string;
         cookieOnly?: boolean;
-        requiresEmailVerification?: boolean;
+        requiresOtp?: boolean;
         email?: string;
         message?: string;
       }>('/api/auth/register', {
         method: 'POST',
         body: JSON.stringify(input),
       });
-      if (res.requiresEmailVerification) {
+      if (res.requiresOtp) {
         return {
-          requiresEmailVerification: true,
+          requiresOtp: true,
           email: res.email,
           message: res.message,
         };
@@ -241,38 +269,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [applyAuthResult]
   );
 
-  const verifyEmail = useCallback(
-    async (email: string, code: string): Promise<SessionUser> => {
+  const verifyTenantOtp = useCallback(
+    async (email: string, otp: string): Promise<SessionUser> => {
       const res = await apiFetch<{
         user: SessionUser;
         organization?: SessionOrg | null;
         token?: string;
         cookieOnly?: boolean;
-      }>('/api/auth/verify-email', {
+      }>('/api/auth/verify-otp', {
         method: 'POST',
-        body: JSON.stringify({ email, code }),
+        body: JSON.stringify({ email, otp }),
       });
       return applyAuthResult(res);
     },
     [applyAuthResult]
   );
 
-  const resendVerification = useCallback(async (email: string) => {
-    return apiFetch<{ ok: boolean; message: string }>('/api/auth/resend-verification', {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-  }, []);
-
-  const forgotPassword = useCallback(async (email: string) => {
+  const forgotPassword = useCallback(async (identifier: string) => {
     return apiFetch<{ ok: boolean; message: string }>('/api/auth/forgot-password', {
       method: 'POST',
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ identifier }),
     });
   }, []);
 
   const resetPassword = useCallback(
-    async (payload: { email: string; code: string; newPassword: string }) => {
+    async (payload: { identifier: string; code: string; newPassword: string }) => {
       return apiFetch<{ ok: boolean; message: string }>('/api/auth/reset-password', {
         method: 'POST',
         body: JSON.stringify(payload),
@@ -304,20 +325,57 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!auth || !googleAuthProvider) {
       throw new Error('Google Sign-In is not configured for this deployment.');
     }
-    setStoredToken(null);
-    await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
-    await signInWithPopup(auth, googleAuthProvider);
-    return refreshSession();
+    manualAuthBusyRef.current = true;
+    try {
+      setStoredToken(null);
+      await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      try {
+        await signInWithPopup(auth, googleAuthProvider);
+      } catch (fbErr: any) {
+        const fbCode = String(fbErr?.code || '');
+        if (fbCode === 'auth/unauthorized-domain') {
+          throw new ApiError(
+            'Google Sign-In is not authorized for this preview domain yet. Sign in with email and password, or add this domain to Firebase Authorized Domains.',
+            403,
+            { code: 'AUTH_UNAUTHORIZED_DOMAIN' }
+          );
+        }
+        if (fbCode === 'auth/popup-blocked' || fbCode === 'auth/popup-closed-by-user') {
+          throw new ApiError(
+            'Google Sign-In popup was blocked or closed in this preview frame. Please allow popups or sign in with your email and password.',
+            400,
+            { code: 'AUTH_POPUP_BLOCKED' }
+          );
+        }
+        throw fbErr;
+      }
+      const resolvedUser = await refreshSession(true);
+      if (!resolvedUser) {
+        throw new ApiError(
+          'Login successful, but your account profile could not be loaded. Please contact support.',
+          500,
+          { code: 'PROFILE_LOAD_FAILED' }
+        );
+      }
+      return resolvedUser;
+    } finally {
+      manualAuthBusyRef.current = false;
+    }
   }, [refreshSession]);
 
   const logout = useCallback(async () => {
-    setStoredToken(null);
-    await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
-    if (auth?.currentUser) {
-      await firebaseSignOut(auth).catch(() => {});
+    manualAuthBusyRef.current = true;
+    try {
+      setStoredToken(null);
+      await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      if (auth?.currentUser) {
+        await firebaseSignOut(auth).catch(() => {});
+      }
+      setUser(null);
+      setOrganization(null);
+    } finally {
+      manualAuthBusyRef.current = false;
     }
-    setUser(null);
-    setOrganization(null);
   }, []);
 
   const googleAuthEnabled = Boolean(auth && googleAuthProvider);
@@ -329,6 +387,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         organization,
         demoModeEnabled,
         googleAuthEnabled,
+        authPolicy,
         loading,
         darkMode,
         toggleDarkMode,
@@ -336,8 +395,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         applySessionToken,
         loginWithCredentials,
         registerAccount,
-        verifyEmail,
-        resendVerification,
+        verifyTenantOtp,
         forgotPassword,
         resetPassword,
         loginDemo,

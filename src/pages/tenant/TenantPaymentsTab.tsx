@@ -28,6 +28,7 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
   const [upiScreenshotUrl, setUpiScreenshotUrl] = useState('');
   const [uploadingScreenshot, setUploadingScreenshot] = useState(false);
   const [submittingUpi, setSubmittingUpi] = useState(false);
+  const [upiIdempotencyKey, setUpiIdempotencyKey] = useState('');
   const [previewScreenshotUrl, setPreviewScreenshotUrl] = useState<string | null>(null);
 
   const openPayModal = (inv: TenantInvoiceRow) => {
@@ -36,6 +37,9 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
     setUtrRef('');
     setUpiNotes('');
     setUpiScreenshotUrl('');
+    setUpiIdempotencyKey(
+      typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `tu-${inv.id}-${Date.now()}`
+    );
   };
 
   const handleCopyUpi = () => {
@@ -76,17 +80,23 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
 
   const handleSubmitUpi = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!upiInv) return;
+    if (!upiInv || submittingUpi) return;
+    const numericAmount = Math.round(Number(upiAmount));
+    if (!Number.isFinite(numericAmount) || numericAmount < 1 || numericAmount > upiInv.balanceDue) {
+      showToast(`Enter an amount between ₹1 and ${formatINR(upiInv.balanceDue)}.`, 'error');
+      return;
+    }
     setSubmittingUpi(true);
     try {
       await apiFetch('/api/tenant/payments', {
         method: 'POST',
         body: JSON.stringify({
           invoiceId: upiInv.id,
-          amount: Math.max(1, Number(upiAmount) || upiInv.balanceDue),
+          amount: numericAmount,
           reference: utrRef.trim(),
           screenshotUrl: upiScreenshotUrl || null,
           notes: upiNotes.trim() || undefined,
+          idempotencyKey: upiIdempotencyKey || undefined,
         }),
       });
       showToast('Payment proof submitted. It stays pending until your hostel owner verifies it.');
@@ -94,6 +104,7 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
       setUtrRef('');
       setUpiNotes('');
       setUpiScreenshotUrl('');
+      setUpiIdempotencyKey('');
       await onRefresh();
     } catch (err: any) {
       showToast(err.message || 'Submission failed', 'error');
@@ -249,19 +260,21 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
                         <span>Pay via UPI</span>
                       </button>
                     )}
-                    <button
-                      type="button"
-                      onClick={() =>
-                        downloadAuthorizedFile(
-                          `/api/tenant/invoices/${inv.id}/receipt.pdf`,
-                          `${inv.invoiceNumber}.pdf`
-                        ).catch((e) => showToast(e.message || 'Download failed', 'error'))
-                      }
-                      className="inline-flex min-h-[36px] flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 dark:border-slate-700 dark:text-slate-200"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      <span>Receipt</span>
-                    </button>
+                    {inv.paidAmount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          downloadAuthorizedFile(
+                            `/api/tenant/invoices/${inv.id}/receipt.pdf`,
+                            `${inv.invoiceNumber}.pdf`
+                          ).catch((e) => showToast(e.message || 'Download failed', 'error'))
+                        }
+                        className="inline-flex min-h-[36px] flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 dark:border-slate-700 dark:text-slate-200"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        <span>Receipt</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -337,19 +350,23 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
                               <span>Pay via UPI</span>
                             </button>
                           )}
-                          <button
-                            type="button"
-                            onClick={() =>
-                              downloadAuthorizedFile(
-                                `/api/tenant/invoices/${inv.id}/receipt.pdf`,
-                                `${inv.invoiceNumber}.pdf`
-                              ).catch((e) => showToast(e.message || 'Download failed', 'error'))
-                            }
-                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                            <span>Receipt</span>
-                          </button>
+                          {inv.paidAmount > 0 ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                downloadAuthorizedFile(
+                                  `/api/tenant/invoices/${inv.id}/receipt.pdf`,
+                                  `${inv.invoiceNumber}.pdf`
+                                ).catch((e) => showToast(e.message || 'Download failed', 'error'))
+                              }
+                              className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>Receipt</span>
+                            </button>
+                          ) : (
+                            <span className="px-1.5 text-[11px] text-slate-400">No receipt</span>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -522,19 +539,25 @@ export function TenantPaymentsTab({ data, onRefresh }: TenantPaymentsTabProps) {
             </div>
 
             <div className="mt-6 flex flex-wrap justify-end gap-2">
-              <button
-                type="button"
-                onClick={() =>
-                  downloadAuthorizedFile(
-                    `/api/tenant/invoices/${selectedInvoice.id}/receipt.pdf`,
-                    `${selectedInvoice.invoiceNumber}.pdf`
-                  ).catch((e) => showToast(e.message || 'Download failed', 'error'))
-                }
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium dark:border-slate-700"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Download Receipt PDF</span>
-              </button>
+              {selectedInvoice.paidAmount > 0 ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadAuthorizedFile(
+                      `/api/tenant/invoices/${selectedInvoice.id}/receipt.pdf`,
+                      `${selectedInvoice.invoiceNumber}.pdf`
+                    ).catch((e) => showToast(e.message || 'Download failed', 'error'))
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium dark:border-slate-700"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>Download Receipt PDF</span>
+                </button>
+              ) : (
+                <span className="self-center text-xs text-slate-500 dark:text-slate-400">
+                  Receipt is generated only after an approved payment.
+                </span>
+              )}
               {selectedInvoice.balanceDue > 0 && (
                 <button
                   type="button"

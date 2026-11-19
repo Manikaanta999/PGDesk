@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { NextFunction, Request, Response } from 'express';
 import { and, eq, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.ts';
+import { isEmailVerificationEnabled } from '../lib/authPolicy.ts';
+import { AppUserRole, computeSessionCookiePolicy, isEmbeddedAuthRequest } from '../lib/authRoles.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { signSessionToken, verifySessionToken } from '../lib/security.ts';
 
@@ -12,7 +14,7 @@ export interface AuthUser {
   email: string;
   phone: string | null;
   photoUrl?: string | null;
-  role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+  role: AppUserRole;
   assignedPropertyIds: number[];
   tokenVersion?: number;
 }
@@ -26,19 +28,10 @@ export interface AuthRequest extends Request {
 export const SESSION_COOKIE_NAME = 'pgdesk_session';
 
 export function isCrossOriginIframeRequest(req: Request): boolean {
-  const secFetchDest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
-  if (secFetchDest === 'iframe') return true;
-  const reqHost = req.get('host') || '';
-  const originHeader = req.headers.origin;
-  if (originHeader && reqHost) {
-    try {
-      const originHost = new URL(originHeader).host;
-      if (originHost && originHost !== reqHost) return true;
-    } catch {
-      // Ignore malformed Origin header
-    }
-  }
-  return false;
+  return isEmbeddedAuthRequest(
+    req.headers as Record<string, string | string[] | undefined>,
+    req.get('host') || ''
+  );
 }
 
 export function getCookieOptions(req: Request) {
@@ -46,27 +39,31 @@ export function getCookieOptions(req: Request) {
     req.secure ||
     req.headers['x-forwarded-proto'] === 'https' ||
     process.env.NODE_ENV === 'production';
-  const isIframe = isCrossOriginIframeRequest(req);
-  const sameSite: 'none' | 'lax' =
-    process.env.NODE_ENV === 'production' && !isIframe
-      ? 'lax'
-      : isHttps && isIframe
-        ? 'none'
-        : isHttps
-          ? 'none'
-          : 'lax';
+  const policy = computeSessionCookiePolicy({
+    isProduction: process.env.NODE_ENV === 'production',
+    isHttps: Boolean(isHttps),
+    isEmbedded: isCrossOriginIframeRequest(req),
+  });
 
   return {
     httpOnly: true,
-    sameSite,
-    secure: Boolean(isHttps),
+    sameSite: policy.sameSite,
+    secure: policy.secure,
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: '/',
   };
 }
 
 export function shouldUseCookieOnlyAuth(req: Request): boolean {
-  return process.env.NODE_ENV === 'production' && !isCrossOriginIframeRequest(req);
+  const isHttps =
+    req.secure ||
+    req.headers['x-forwarded-proto'] === 'https' ||
+    process.env.NODE_ENV === 'production';
+  return computeSessionCookiePolicy({
+    isProduction: process.env.NODE_ENV === 'production',
+    isHttps: Boolean(isHttps),
+    isEmbedded: isCrossOriginIframeRequest(req),
+  }).cookieOnly;
 }
 
 export function setSessionCookie(req: Request, res: Response, token: string) {
@@ -76,7 +73,7 @@ export function setSessionCookie(req: Request, res: Response, token: string) {
 export async function issueUserSession(
   req: Request,
   res: Response,
-  user: { id: number; organizationId: number; role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT'; tokenVersion?: number },
+  user: { id: number; organizationId: number; role: AppUserRole; tokenVersion?: number },
   existingSessionId?: string
 ): Promise<{ token: string; cookieOnly: boolean; sessionId: string }> {
   const sessionId = existingSessionId || crypto.randomUUID();
@@ -117,7 +114,8 @@ async function loadUserById(userId: number, expectedTokenVersion?: number): Prom
     .limit(1);
   const u = rows[0];
   if (!u || !u.isActive) return null;
-  if (u.role !== 'ADMIN' && u.emailVerified === false) return null;
+  if (u.role !== 'OWNER' && u.role !== 'MANAGER' && u.role !== 'TENANT') return null;
+  if (isEmailVerificationEnabled() && u.role === 'TENANT' && u.emailVerified === false) return null;
   if (expectedTokenVersion !== undefined && expectedTokenVersion !== (u.tokenVersion ?? 1)) {
     return null;
   }
@@ -188,7 +186,7 @@ export async function resolveAuthUser(
     if (!idToken) return null;
     try {
       const decoded = await adminAuth.verifyIdToken(idToken);
-      const email = decoded.email || `${decoded.uid}@users.pgdesk.app`;
+      const email = (decoded.email || `${decoded.uid}@users.pgdesk.app`).trim().toLowerCase();
       const existing = await db
         .select()
         .from(schema.users)
@@ -198,6 +196,7 @@ export async function resolveAuthUser(
       if (existing[0]) {
         const u = existing[0];
         if (!u.isActive) return null;
+        if (u.role !== 'OWNER' && u.role !== 'MANAGER' && u.role !== 'TENANT') return null;
         return {
           authMethod: 'GOOGLE',
           user: {
@@ -214,22 +213,21 @@ export async function resolveAuthUser(
         };
       }
 
-      const byEmail =
-        decoded.email_verified === true
-          ? await db
-              .select()
-              .from(schema.users)
-              .where(eq(schema.users.email, email))
-              .limit(1)
-          : [];
+      const byEmail = await db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.email, email))
+        .limit(1);
 
       if (byEmail[0]) {
         if (!byEmail[0].isActive) return null;
+        if (byEmail[0].role !== 'OWNER' && byEmail[0].role !== 'MANAGER' && byEmail[0].role !== 'TENANT') return null;
         const [updated] = await db
           .update(schema.users)
-          .set({ uid: decoded.uid, emailVerified: true, updatedAt: new Date() })
+          .set({ uid: decoded.uid, updatedAt: new Date() })
           .where(eq(schema.users.id, byEmail[0].id))
           .returning();
+        if (updated.role !== 'OWNER' && updated.role !== 'MANAGER' && updated.role !== 'TENANT') return null;
         return {
           authMethod: 'GOOGLE',
           user: {
@@ -248,8 +246,61 @@ export async function resolveAuthUser(
         };
       }
 
-      // Unknown Google users cannot bypass the owner registration token or create unverified workspaces
-      return null;
+      const displayName = decoded.name || email.split('@')[0];
+      const orgName = `${displayName}'s Residences`;
+      const baseSlug =
+        orgName
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '') || 'pg-workspace';
+      const [createdOrg] = await db
+        .insert(schema.organizations)
+        .values({
+          name: orgName,
+          slug: `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`,
+          upiId: `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`,
+          upiPayeeName: orgName,
+          planTier: 'STARTER',
+          phone: '+91 00000 00000',
+          email,
+          address: 'India',
+        })
+        .returning();
+
+      const [upserted] = await db
+        .insert(schema.users)
+        .values({
+          uid: decoded.uid,
+          organizationId: createdOrg.id,
+          name: displayName,
+          email,
+          role: 'OWNER',
+          assignedPropertyIds: [],
+          isActive: true,
+        })
+        .onConflictDoUpdate({
+          target: schema.users.email,
+          set: { uid: decoded.uid, updatedAt: new Date() },
+        })
+        .returning();
+
+      const role = upserted.role === 'MANAGER' || upserted.role === 'TENANT' ? upserted.role : 'OWNER';
+      return {
+        authMethod: 'GOOGLE',
+        user: {
+          id: upserted.id,
+          organizationId: upserted.organizationId,
+          name: upserted.name,
+          email: upserted.email,
+          phone: upserted.phone,
+          photoUrl: upserted.photoUrl,
+          role,
+          assignedPropertyIds: Array.isArray(upserted.assignedPropertyIds)
+            ? upserted.assignedPropertyIds
+            : [],
+          tokenVersion: upserted.tokenVersion ?? 1,
+        },
+      };
     } catch (err) {
       console.error('Firebase ID token verification failed:', err);
       return null;
@@ -275,7 +326,7 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
   }
 }
 
-export function requireRole(...allowedRoles: Array<'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT'>) {
+export function requireRole(...allowedRoles: AppUserRole[]) {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
@@ -288,14 +339,12 @@ export function requireRole(...allowedRoles: Array<'ADMIN' | 'OWNER' | 'MANAGER'
 }
 
 export function canAccessProperty(user: AuthUser, propertyId: number): boolean {
-  if (user.role === 'ADMIN') return false;
   if (user.role === 'OWNER') return true;
   if (user.assignedPropertyIds.length === 0) return true;
   return user.assignedPropertyIds.includes(propertyId);
 }
 
 export function getAllowedPropertyIds(user: AuthUser, allPropertyIds: number[]): number[] {
-  if (user.role === 'ADMIN') return [];
   if (user.role === 'OWNER' || user.assignedPropertyIds.length === 0) {
     return allPropertyIds;
   }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Building2, ChevronDown, ChevronUp, Download, History } from 'lucide-react';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
@@ -150,19 +150,23 @@ export function TenantPastHostelsTab({ pastStays }: TenantPastHostelsTabProps) {
                                     </span>
                                   </p>
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    downloadAuthorizedFile(
-                                      `/api/tenant/invoices/${inv.id}/receipt.pdf`,
-                                      `Receipt-${inv.invoiceNumber}.pdf`
-                                    ).catch((e) => showToast(e.message || 'Could not download receipt', 'error'))
-                                  }
-                                  className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 font-semibold text-teal-700 hover:bg-slate-50 dark:border-slate-700 dark:text-teal-400 dark:hover:bg-slate-800"
-                                >
-                                  <Download className="h-3.5 w-3.5" />
-                                  <span>Download Receipt PDF</span>
-                                </button>
+                                {inv.paidAmount > 0 ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      downloadAuthorizedFile(
+                                        `/api/tenant/invoices/${inv.id}/receipt.pdf`,
+                                        `Receipt-${inv.invoiceNumber}.pdf`
+                                      ).catch((e) => showToast(e.message || 'Could not download receipt', 'error'))
+                                    }
+                                    className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 font-semibold text-teal-700 hover:bg-slate-50 dark:border-slate-700 dark:text-teal-400 dark:hover:bg-slate-800"
+                                  >
+                                    <Download className="h-3.5 w-3.5" />
+                                    <span>Download Receipt PDF</span>
+                                  </button>
+                                ) : (
+                                  <span className="text-xs text-slate-400">No payment receipt</span>
+                                )}
                               </div>
                               {invPayments.length > 0 && (
                                 <div className="mt-2.5 space-y-1 border-t border-slate-100 pt-2 dark:border-slate-800">

@@ -1,58 +1,33 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { ArrowLeft, Eye, EyeOff, LogOut, UserPlus } from 'lucide-react';
+import { AlertCircle, ArrowLeft, Eye, EyeOff, LogOut, UserPlus } from 'lucide-react';
 import { LanguageSwitcher } from '../components/ui/LanguageSwitcher';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
-import { loginSchema } from '../lib/validation';
+import { classifyAuthError, getDashboardRouteForRole } from '../lib/authRoles';
+import { indianPhoneSchema, loginSchema } from '../lib/validation';
 
 type LoginFormValues = z.infer<typeof loginSchema>;
 
 const signupFormSchema = z
   .object({
     accountType: z.enum(['OWNER', 'TENANT']),
-    ownerRegistrationToken: z.string().trim(),
     name: z.string().trim().min(2, 'Full name is required').max(120),
     organizationName: z.string().trim().max(120),
     email: z.string().trim().email('Enter a valid email address'),
-    phone: z
-      .string()
-      .trim()
-      .refine((val) => {
-        if (!val) return true;
-        const digits = val.replace(/\D/g, '');
-        return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
-      }, 'Enter a valid 10-digit Indian mobile number'),
+    phone: indianPhoneSchema,
     password: z.string().min(6, 'Password must be at least 6 characters').max(100),
   })
-  .superRefine((val, ctx) => {
-    if (val.accountType === 'OWNER') {
-      if (val.organizationName.trim().length < 2) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'PG / Business name is required (min 2 characters)',
-          path: ['organizationName'],
-        });
-      }
-      if (!val.ownerRegistrationToken || val.ownerRegistrationToken.trim().length < 10) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'Valid Owner Registration Token is required',
-          path: ['ownerRegistrationToken'],
-        });
-      }
-      if (!val.phone || val.phone.trim().length === 0) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'Enter a valid 10-digit Indian mobile number',
-          path: ['phone'],
-        });
-      }
+  .refine(
+    (val) => val.accountType !== 'OWNER' || val.organizationName.trim().length >= 2,
+    {
+      message: 'PG / Business name is required (min 2 characters)',
+      path: ['organizationName'],
     }
-  });
+  );
 
 type SignupFormValues = z.infer<typeof signupFormSchema>;
 
@@ -60,12 +35,9 @@ export function LoginPage() {
   const {
     user,
     googleAuthEnabled,
+    authPolicy,
     loginWithCredentials,
     registerAccount,
-    verifyEmail,
-    resendVerification,
-    forgotPassword,
-    resetPassword,
     loginWithGoogle,
     logout,
   } = useAuth();
@@ -73,43 +45,30 @@ export function LoginPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const initialModeParam = searchParams.get('mode');
-  const [mode, setMode] = useState<'login' | 'register' | 'verify-email' | 'forgot' | 'reset'>(
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot'>(
     initialModeParam === 'register'
       ? 'register'
-      : initialModeParam === 'forgot'
+      : initialModeParam === 'forgot' || initialModeParam === 'reset'
         ? 'forgot'
-        : initialModeParam === 'reset'
-          ? 'reset'
-          : initialModeParam === 'verify-email'
-            ? 'verify-email'
-            : 'login'
+        : 'login'
   );
   const [googleBusy, setGoogleBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const loginInFlightRef = useRef(false);
+  const signupInFlightRef = useRef(false);
 
   // Password visibility toggles
   const [showLoginPwd, setShowLoginPwd] = useState(false);
   const [showSignupPwd, setShowSignupPwd] = useState(false);
-  const [showResetPwd, setShowResetPwd] = useState(false);
-  const [showConfirmResetPwd, setShowConfirmResetPwd] = useState(false);
-
-  // Email verification state
-  const [verifyEmailAddr, setVerifyEmailAddr] = useState(searchParams.get('email') || '');
-  const [verifyCode, setVerifyCode] = useState('');
-  const [verifyingEmail, setVerifyingEmail] = useState(false);
-  const [resendBusy, setResendBusy] = useState(false);
-
-  // Forgot / Reset password state (email-only)
-  const [resetEmail, setResetEmail] = useState(searchParams.get('email') || searchParams.get('identifier') || '');
-  const [resetCode, setResetCode] = useState(searchParams.get('code') || '');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmNewPassword, setConfirmNewPassword] = useState('');
-  const [resetBusy, setResetBusy] = useState(false);
 
   useEffect(() => {
     const m = searchParams.get('mode');
-    if (m === 'register' || m === 'forgot' || m === 'reset' || m === 'login' || m === 'verify-email') {
+    if (m === 'register' || m === 'login') {
       setMode(m);
+    } else if (m === 'forgot' || m === 'reset') {
+      setMode('forgot');
     }
+    setAuthError(null);
   }, [searchParams]);
 
   const loginForm = useForm<LoginFormValues>({
@@ -121,7 +80,6 @@ export function LoginPage() {
     resolver: zodResolver(signupFormSchema),
     defaultValues: {
       accountType: searchParams.get('role') === 'tenant' ? 'TENANT' : 'OWNER',
-      ownerRegistrationToken: '',
       name: '',
       organizationName: '',
       email: '',
@@ -133,147 +91,77 @@ export function LoginPage() {
   const accountType = signupForm.watch('accountType');
 
   const routeAfterLogin = (role: string) => {
-    if (role === 'ADMIN') {
-      navigate('/admin', { replace: true });
-    } else if (role === 'TENANT') {
-      navigate('/tenant', { replace: true });
-    } else {
-      navigate('/dashboard', { replace: true });
-    }
+    navigate(getDashboardRouteForRole(role), { replace: true });
   };
 
   const onLoginSubmit = async (values: LoginFormValues) => {
+    if (loginInFlightRef.current) return;
+    loginInFlightRef.current = true;
+    setAuthError(null);
     try {
-      const u = await loginWithCredentials(values.identifier, values.password);
+      const normalizedIdentifier = values.identifier.trim();
+      const u = await loginWithCredentials(normalizedIdentifier, values.password);
       showToast(`Welcome back, ${u.name}`);
       routeAfterLogin(u.role);
-    } catch (err: any) {
-      if (err?.data?.requiresEmailVerification && err?.data?.email) {
-        setVerifyEmailAddr(err.data.email);
-        setVerifyCode('');
-        setMode('verify-email');
-        showToast(err.message || 'Please verify your email address to continue', 'info');
-        return;
-      }
-      showToast(err.message || 'Sign in failed', 'error');
+    } catch (err: unknown) {
+      const classified = classifyAuthError(err, 'Sign in failed');
+      setAuthError(classified.message);
+      showToast(classified.message, 'error');
+    } finally {
+      loginInFlightRef.current = false;
     }
   };
 
   const onSignupSubmit = async (values: SignupFormValues) => {
+    if (signupInFlightRef.current) return;
+    signupInFlightRef.current = true;
+    setAuthError(null);
     try {
       const result = await registerAccount({
         ...values,
-        ownerRegistrationToken:
-          values.accountType === 'OWNER' ? values.ownerRegistrationToken?.trim() : undefined,
-        phone: values.phone?.trim() || undefined,
+        name: values.name.trim(),
+        organizationName: values.organizationName.trim(),
+        email: values.email.trim(),
+        phone: values.phone.trim(),
       });
-      if (result.requiresEmailVerification && result.email) {
-        setVerifyEmailAddr(result.email);
-        setVerifyCode('');
-        setMode('verify-email');
-        showToast(
-          result.message || 'Verification code sent to your email. Enter it below to activate your account.',
-          'info'
-        );
-        return;
-      }
       if (result.user) {
         showToast(`Account created! Welcome to PGDesk, ${result.user.name}`);
         routeAfterLogin(result.user.role);
       }
-    } catch (err: any) {
-      showToast(err.message || 'Could not create account', 'error');
-    }
-  };
-
-  const onVerifyEmailSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setVerifyingEmail(true);
-    try {
-      const u = await verifyEmail(verifyEmailAddr.trim(), verifyCode.trim());
-      showToast(`Email verified! Welcome to PGDesk, ${u.name}`);
-      routeAfterLogin(u.role);
-    } catch (err: any) {
-      showToast(err.message || 'Invalid or expired verification code', 'error');
+    } catch (err: unknown) {
+      const classified = classifyAuthError(err, 'Could not create account');
+      setAuthError(classified.message);
+      showToast(classified.message, 'error');
     } finally {
-      setVerifyingEmail(false);
-    }
-  };
-
-  const onResendVerification = async () => {
-    if (!verifyEmailAddr.trim() || resendBusy) return;
-    setResendBusy(true);
-    try {
-      const res = await resendVerification(verifyEmailAddr.trim());
-      showToast(res.message || 'Verification code sent to your email', 'info');
-    } catch (err: any) {
-      showToast(err.message || 'Could not resend verification code', 'error');
-    } finally {
-      setResendBusy(false);
-    }
-  };
-
-  const onForgotSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setResetBusy(true);
-    try {
-      const res = await forgotPassword(resetEmail.trim());
-      showToast(res.message, 'info');
-      setMode('reset');
-    } catch (err: any) {
-      showToast(err.message || 'Could not initiate reset', 'error');
-    } finally {
-      setResetBusy(false);
-    }
-  };
-
-  const onResetPasswordSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (newPassword.length < 6) {
-      showToast('New password must be at least 6 characters', 'error');
-      return;
-    }
-    if (newPassword !== confirmNewPassword) {
-      showToast('New password and confirmation do not match', 'error');
-      return;
-    }
-    setResetBusy(true);
-    try {
-      const res = await resetPassword({
-        email: resetEmail.trim(),
-        code: resetCode.trim(),
-        newPassword,
-      });
-      showToast(res.message);
-      setResetCode('');
-      setNewPassword('');
-      setConfirmNewPassword('');
-      setMode('login');
-    } catch (err: any) {
-      showToast(err.message || 'Could not reset password', 'error');
-    } finally {
-      setResetBusy(false);
+      signupInFlightRef.current = false;
     }
   };
 
   const handleGoogle = async () => {
+    if (googleBusy) return;
     setGoogleBusy(true);
+    setAuthError(null);
     try {
       const u = await loginWithGoogle();
       if (u) {
         showToast(`Signed in with Google as ${u.name}`);
         routeAfterLogin(u.role);
       } else {
-        showToast('Could not complete Google verification with server', 'error');
+        const msg = 'Login successful, but your account profile could not be loaded. Please contact support.';
+        setAuthError(msg);
+        showToast(msg, 'error');
       }
-    } catch (err: any) {
-      showToast(err.message || 'Google Sign-In failed', 'error');
+    } catch (err: unknown) {
+      const classified = classifyAuthError(err, 'Google Sign-In failed');
+      setAuthError(classified.message);
+      showToast(classified.message, 'error');
     } finally {
       setGoogleBusy(false);
     }
   };
 
   const handleLogout = async () => {
+    setAuthError(null);
     await logout();
     showToast('Logged out successfully');
   };
@@ -330,7 +218,10 @@ export function LoginPage() {
             <div className="grid grid-cols-2 gap-1 rounded-xl border border-slate-200 bg-slate-100 p-1 dark:border-slate-800 dark:bg-slate-950">
               <button
                 type="button"
-                onClick={() => setMode('login')}
+                onClick={() => {
+                  setMode('login');
+                  setAuthError(null);
+                }}
                 className={`rounded-lg py-2 text-xs font-semibold transition-colors ${
                   mode === 'login'
                     ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
@@ -341,7 +232,10 @@ export function LoginPage() {
               </button>
               <button
                 type="button"
-                onClick={() => setMode('register')}
+                onClick={() => {
+                  setMode('register');
+                  setAuthError(null);
+                }}
                 className={`inline-flex items-center justify-center gap-1.5 rounded-lg py-2 text-xs font-semibold transition-colors ${
                   mode === 'register'
                     ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
@@ -351,6 +245,16 @@ export function LoginPage() {
                 <UserPlus className="h-3.5 w-3.5" />
                 <span>Create Account</span>
               </button>
+            </div>
+          )}
+
+          {authError && (mode === 'login' || mode === 'register') && (
+            <div
+              role="alert"
+              className="mt-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs font-medium text-red-800 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
+            >
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+              <span>{authError}</span>
             </div>
           )}
 
@@ -387,11 +291,7 @@ export function LoginPage() {
                     </label>
                     <button
                       type="button"
-                      onClick={() => {
-                        const typed = loginForm.getValues('identifier') || '';
-                        setResetEmail(typed.includes('@') ? typed : '');
-                        setMode('forgot');
-                      }}
+                      onClick={() => setMode('forgot')}
                       className="text-xs font-medium text-teal-700 hover:underline dark:text-teal-400"
                     >
                       Forgot password?
@@ -487,52 +387,29 @@ export function LoginPage() {
                 </div>
 
                 {accountType === 'OWNER' && (
-                  <>
-                    <div>
-                      <label htmlFor="reg-token" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                        Owner Registration Token *
-                      </label>
-                      <input
-                        id="reg-token"
-                        type="text"
-                        placeholder="PGDESKOWNER-XXXX-XXXX-XXXX"
-                        {...signupForm.register('ownerRegistrationToken')}
-                        className={`${inputClass} font-mono uppercase`}
-                      />
-                      <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                        Single-use onboarding token issued by PGDesk platform admin.
+                  <div>
+                    <label htmlFor="reg-org" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      PG / Hostel Business Name
+                    </label>
+                    <input
+                      id="reg-org"
+                      type="text"
+                      placeholder="e.g., GreenPark Residences"
+                      {...signupForm.register('organizationName')}
+                      className={inputClass}
+                    />
+                    {signupForm.formState.errors.organizationName && (
+                      <p className="mt-1 text-xs text-red-600">
+                        {signupForm.formState.errors.organizationName.message}
                       </p>
-                      {signupForm.formState.errors.ownerRegistrationToken && (
-                        <p className="mt-1 text-xs text-red-600">
-                          {signupForm.formState.errors.ownerRegistrationToken.message}
-                        </p>
-                      )}
-                    </div>
-
-                    <div>
-                      <label htmlFor="reg-org" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                        PG / Hostel Business Name *
-                      </label>
-                      <input
-                        id="reg-org"
-                        type="text"
-                        placeholder="e.g., GreenPark Residences"
-                        {...signupForm.register('organizationName')}
-                        className={inputClass}
-                      />
-                      {signupForm.formState.errors.organizationName && (
-                        <p className="mt-1 text-xs text-red-600">
-                          {signupForm.formState.errors.organizationName.message}
-                        </p>
-                      )}
-                    </div>
-                  </>
+                    )}
+                  </div>
                 )}
 
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div>
                     <label htmlFor="reg-email" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Email Address *
+                      Email Address
                     </label>
                     <input
                       id="reg-email"
@@ -548,7 +425,7 @@ export function LoginPage() {
 
                   <div>
                     <label htmlFor="reg-phone" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Mobile Number {accountType === 'TENANT' ? '(Optional)' : '*'}
+                      Mobile Number
                     </label>
                     <input
                       id="reg-phone"
@@ -600,223 +477,28 @@ export function LoginPage() {
             </>
           )}
 
-          {mode === 'verify-email' && (
-            <form onSubmit={onVerifyEmailSubmit} className="space-y-4">
-              <h1 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-                Verify Your Email Address
-              </h1>
-              <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                Enter the 6-digit verification code sent to{' '}
-                <strong className="text-slate-900 dark:text-slate-200">{verifyEmailAddr || 'your email'}</strong> to
-                activate your PGDesk account.
-              </p>
-              {!verifyEmailAddr && (
-                <div>
-                  <label htmlFor="verify-email-addr" className="block text-xs font-medium">
-                    Email Address
-                  </label>
-                  <input
-                    id="verify-email-addr"
-                    type="email"
-                    required
-                    value={verifyEmailAddr}
-                    onChange={(e) => setVerifyEmailAddr(e.target.value)}
-                    placeholder="name@company.com"
-                    className={inputClass}
-                  />
-                </div>
-              )}
-              <div>
-                <label htmlFor="verify-email-code" className="block text-xs font-medium">
-                  6-Digit Email Verification Code
-                </label>
-                <input
-                  id="verify-email-code"
-                  required
-                  maxLength={6}
-                  pattern="\d{6}"
-                  value={verifyCode}
-                  onChange={(e) => setVerifyCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  placeholder="Enter 6-digit code"
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 font-mono text-base tracking-widest focus:border-teal-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-                />
-              </div>
-              <button
-                type="submit"
-                disabled={verifyingEmail || verifyCode.length !== 6}
-                className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
-              >
-                {verifyingEmail ? 'Verifying...' : 'Verify Email & Continue'}
-              </button>
-              <div className="flex items-center justify-between gap-2 pt-1 text-xs">
-                <button
-                  type="button"
-                  disabled={resendBusy || !verifyEmailAddr.trim()}
-                  onClick={onResendVerification}
-                  className="font-medium text-teal-700 hover:underline disabled:opacity-50 dark:text-teal-400"
-                >
-                  {resendBusy ? 'Sending...' : 'Resend verification code'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMode('login')}
-                  className="font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white"
-                >
-                  Back to Sign In
-                </button>
-              </div>
-            </form>
-          )}
-
           {mode === 'forgot' && (
-            <form onSubmit={onForgotSubmit} className="space-y-4">
+            <div className="space-y-4">
               <h1 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-                Reset Password
+                Forgot Password
               </h1>
-              <p className="text-xs text-slate-600 dark:text-slate-400">
-                Enter your registered email address to receive a 6-digit password reset code.
-              </p>
-              <div>
-                <label htmlFor="forgot-email" className="block text-xs font-medium">
-                  Registered Email Address
-                </label>
-                <input
-                  id="forgot-email"
-                  type="email"
-                  required
-                  value={resetEmail}
-                  onChange={(e) => setResetEmail(e.target.value)}
-                  placeholder="name@company.com"
-                  className={inputClass}
-                />
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+                {authPolicy.forgotPasswordMessage}
               </div>
-              <button
-                type="submit"
-                disabled={resetBusy}
-                className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
-              >
-                {resetBusy ? 'Sending code...' : 'Send Email Reset Code'}
-              </button>
               {googleAuthEnabled && (
                 <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-400">
-                  Signed up with Google? Go back, click <strong>Continue with Google</strong>, and set or reset your
+                  Signed up with Google? Go back, click <strong>Continue with Google</strong>, and create or update your
                   password anytime under <strong>Account &amp; Security</strong>.
                 </p>
               )}
               <button
                 type="button"
                 onClick={() => setMode('login')}
-                className="w-full text-center text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white"
+                className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-teal-800"
               >
                 Back to Sign In
               </button>
-            </form>
-          )}
-
-          {mode === 'reset' && (
-            <form onSubmit={onResetPasswordSubmit} className="space-y-4">
-              <h1 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-                Set New Password
-              </h1>
-              <p className="text-xs text-slate-600 dark:text-slate-400">
-                Enter the 6-digit code sent to your email and choose a new password for your account.
-              </p>
-              <div>
-                <label htmlFor="reset-email" className="block text-xs font-medium">
-                  Registered Email Address
-                </label>
-                <input
-                  id="reset-email"
-                  type="email"
-                  required
-                  value={resetEmail}
-                  onChange={(e) => setResetEmail(e.target.value)}
-                  placeholder="name@company.com"
-                  className={inputClass}
-                />
-              </div>
-              <div>
-                <label htmlFor="reset-code" className="block text-xs font-medium">
-                  6-Digit Reset Code
-                </label>
-                <input
-                  id="reset-code"
-                  required
-                  maxLength={6}
-                  value={resetCode}
-                  onChange={(e) => setResetCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  placeholder="Enter 6-digit code"
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 font-mono text-base tracking-widest focus:border-teal-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-                />
-              </div>
-              <div>
-                <label htmlFor="reset-new-pwd" className="block text-xs font-medium">
-                  New Password (min 6 characters)
-                </label>
-                <div className="relative">
-                  <input
-                    id="reset-new-pwd"
-                    type={showResetPwd ? 'text' : 'password'}
-                    required
-                    minLength={6}
-                    value={newPassword}
-                    onChange={(e) => setNewPassword(e.target.value)}
-                    placeholder="Enter new password"
-                    className={`${inputClass} pr-10`}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowResetPwd((v) => !v)}
-                    aria-label={showResetPwd ? 'Hide password' : 'Show password'}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-                  >
-                    {showResetPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-              </div>
-              <div>
-                <label htmlFor="reset-confirm-pwd" className="block text-xs font-medium">
-                  Confirm New Password
-                </label>
-                <div className="relative">
-                  <input
-                    id="reset-confirm-pwd"
-                    type={showConfirmResetPwd ? 'text' : 'password'}
-                    required
-                    minLength={6}
-                    value={confirmNewPassword}
-                    onChange={(e) => setConfirmNewPassword(e.target.value)}
-                    placeholder="Re-enter new password"
-                    className={`${inputClass} pr-10`}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowConfirmResetPwd((v) => !v)}
-                    aria-label={showConfirmResetPwd ? 'Hide password' : 'Show password'}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-                  >
-                    {showConfirmResetPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-                {confirmNewPassword.length > 0 && newPassword !== confirmNewPassword && (
-                  <p className="mt-1 text-xs text-red-600">Passwords do not match</p>
-                )}
-              </div>
-              <button
-                type="submit"
-                disabled={resetBusy || resetCode.length !== 6}
-                className="w-full rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
-              >
-                {resetBusy ? 'Updating...' : 'Update Password'}
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode('login')}
-                className="w-full text-center text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white"
-              >
-                Back to Sign In
-              </button>
-            </form>
+            </div>
           )}
 
           {(mode === 'login' || mode === 'register') && googleAuthEnabled && (

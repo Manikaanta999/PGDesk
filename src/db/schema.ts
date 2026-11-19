@@ -13,7 +13,6 @@ import {
 } from 'drizzle-orm/pg-core';
 
 export const userRoleEnum = pgEnum('user_role', ['ADMIN', 'OWNER', 'MANAGER', 'TENANT']);
-export const ownerTokenStatusEnum = pgEnum('owner_token_status', ['UNUSED', 'USED', 'EXPIRED', 'REVOKED']);
 export const accountLinkStatusEnum = pgEnum('account_link_status', [
   'NO_ACCOUNT',
   'ACCOUNT_CREATED',
@@ -32,7 +31,7 @@ export const depositStatusEnum = pgEnum('deposit_status', [
   'REFUNDED',
   'FORFEITED',
 ]);
-export const invoiceStatusEnum = pgEnum('invoice_status', ['PAID', 'PENDING', 'OVERDUE', 'PARTIAL']);
+export const invoiceStatusEnum = pgEnum('invoice_status', ['PAID', 'PENDING', 'UNPAID', 'OVERDUE', 'PARTIAL']);
 export const paymentMethodEnum = pgEnum('payment_method', ['CASH', 'UPI', 'BANK', 'ONLINE']);
 export const paymentApprovalEnum = pgEnum('payment_approval_status', [
   'APPROVED',
@@ -161,29 +160,6 @@ export const users = pgTable(
     index('users_org_idx').on(table.organizationId),
     uniqueIndex('users_email_idx').on(table.email),
     index('users_phone_idx').on(table.phone),
-  ]
-);
-
-export const ownerRegistrationTokens = pgTable(
-  'owner_registration_tokens',
-  {
-    id: serial('id').primaryKey(),
-    tokenHash: text('token_hash').notNull(),
-    tokenLast4: text('token_last4').notNull(),
-    note: text('note').notNull().default(''),
-    status: ownerTokenStatusEnum('status').notNull().default('UNUSED'),
-    expiresAt: timestamp('expires_at').notNull(),
-    createdByUserId: integer('created_by_user_id').references(() => users.id),
-    usedByUserId: integer('used_by_user_id').references(() => users.id),
-    usedByOrganizationId: integer('used_by_organization_id').references(() => organizations.id),
-    usedAt: timestamp('used_at'),
-    revokedByUserId: integer('revoked_by_user_id').references(() => users.id),
-    revokedAt: timestamp('revoked_at'),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-  },
-  (table) => [
-    uniqueIndex('owner_reg_tokens_hash_idx').on(table.tokenHash),
-    index('owner_reg_tokens_status_idx').on(table.status),
   ]
 );
 
@@ -397,14 +373,14 @@ export const invoices = pgTable(
     amount: integer('amount').notNull(),
     paidAmount: integer('paid_amount').notNull().default(0),
     dueDate: text('due_date').notNull(), // YYYY-MM-DD
-    status: invoiceStatusEnum('status').notNull().default('PENDING'),
+    status: invoiceStatusEnum('status').notNull().default('UNPAID'),
     isProRata: boolean('is_pro_rata').notNull().default(false),
     notes: text('notes'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
   (table) => [
-    uniqueIndex('invoices_number_idx').on(table.invoiceNumber),
+    uniqueIndex('invoices_number_idx').on(table.organizationId, table.invoiceNumber),
     index('invoices_org_idx').on(table.organizationId),
     index('invoices_tenant_idx').on(table.tenantId),
     index('invoices_property_idx').on(table.propertyId),
@@ -433,6 +409,7 @@ export const payments = pgTable(
     approvalStatus: paymentApprovalEnum('approval_status').notNull().default('APPROVED'),
     paidAt: text('paid_at').notNull(), // YYYY-MM-DD
     recordedByUserId: integer('recorded_by_user_id').references(() => users.id),
+    idempotencyKey: text('idempotency_key'),
     notes: text('notes'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -442,6 +419,7 @@ export const payments = pgTable(
     index('payments_invoice_idx').on(table.invoiceId),
     index('payments_tenant_idx').on(table.tenantId),
     index('payments_approval_idx').on(table.approvalStatus),
+    uniqueIndex('payments_org_idempotency_idx').on(table.organizationId, table.idempotencyKey),
   ]
 );
 
@@ -752,20 +730,5 @@ export const complaintCommentsRelations = relations(complaintComments, ({ one })
   complaint: one(complaints, {
     fields: [complaintComments.complaintId],
     references: [complaints.id],
-  }),
-}));
-
-export const ownerRegistrationTokensRelations = relations(ownerRegistrationTokens, ({ one }) => ({
-  createdBy: one(users, {
-    fields: [ownerRegistrationTokens.createdByUserId],
-    references: [users.id],
-  }),
-  usedBy: one(users, {
-    fields: [ownerRegistrationTokens.usedByUserId],
-    references: [users.id],
-  }),
-  usedByOrganization: one(organizations, {
-    fields: [ownerRegistrationTokens.usedByOrganizationId],
-    references: [organizations.id],
   }),
 }));

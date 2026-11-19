@@ -1,16 +1,14 @@
-import cookieParser from 'cookie-parser';
 import 'dotenv/config';
+import cookieParser from 'cookie-parser';
 import { and, eq, isNull, ne } from 'drizzle-orm';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { db, schema } from './src/db/index.ts';
 import { ensureSeeded } from './src/db/seed.ts';
-import { PLATFORM_ORG_SLUG } from './src/lib/platformAuth.ts';
 import { isDemoModeEnabled } from './src/lib/security.ts';
-import { ensureAdminBootstrapped } from './src/server/adminBootstrap.ts';
 import { accountRouter } from './src/server/routes/account.ts';
-import { adminRouter } from './src/server/routes/admin.ts';
+import { adminAuthRouter } from './src/server/routes/adminAuth.ts';
 import { authRouter } from './src/server/routes/auth.ts';
 import { billingRouter } from './src/server/routes/billing.ts';
 import { cronRouter } from './src/server/routes/cron.ts';
@@ -46,27 +44,9 @@ async function startServer() {
     res.json({ ok: true, service: 'pgdesk' });
   });
 
-  void ensureSeeded().catch((err) => {
-    console.error('Demo seed failed:', err);
-  });
-
-  let bootstrapError: unknown = null;
-  const bootstrapPromise = ensureAdminBootstrapped().catch((err) => {
-    bootstrapError = err;
-    console.error('Admin bootstrap failed; API requests will remain unavailable:', err);
-  });
-
-  app.use('/api', async (_req, res, next) => {
-    await bootstrapPromise;
-    if (bootstrapError) {
-      return res.status(503).json({ error: 'Database initialization failed. Check server logs.' });
-    }
-    return next();
-  });
-
   app.use('/api/auth', authRouter);
-  app.use('/api/admin', adminRouter);
   app.use('/api/account', accountRouter);
+  app.use('/api/admin', adminAuthRouter);
   app.use('/api/public', publicRouter);
   app.use('/api/dashboard', dashboardRouter);
   app.use('/api/properties', propertiesRouter);
@@ -75,6 +55,22 @@ async function startServer() {
   app.use('/api/tenant', tenantPortalRouter);
   app.use('/api/cron', cronRouter);
   app.use('/api', operationsRouter);
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
+  });
+  app.use('/api', (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const anyErr = err as { status?: number; type?: string; message?: string; code?: string } | null;
+    console.error('Unhandled /api error:', {
+      name: err instanceof Error ? err.name : 'UnknownError',
+      message: anyErr?.message || 'Unexpected error',
+      code: anyErr?.code,
+    });
+    const status = typeof anyErr?.status === 'number' && anyErr.status >= 400 && anyErr.status < 600 ? anyErr.status : 500;
+    res.status(status).json({
+      code: status >= 500 ? 'INTERNAL_SERVER_ERROR' : 'BAD_REQUEST',
+      error: status >= 500 ? 'Internal server error. Please try again.' : (anyErr?.message || 'Invalid request'),
+    });
+  });
 
   // SEO sitemap.xml & robots.txt for public landing and PG listings
   app.get('/sitemap.xml', async (req, res) => {
@@ -88,15 +84,10 @@ async function startServer() {
         .innerJoin(schema.organizations, eq(schema.properties.organizationId, schema.organizations.id))
         .where(
           demoEnabled
-            ? and(
-                eq(schema.properties.isPublic, true),
-                isNull(schema.properties.deletedAt),
-                ne(schema.organizations.slug, PLATFORM_ORG_SLUG)
-              )
+            ? and(eq(schema.properties.isPublic, true), isNull(schema.properties.deletedAt))
             : and(
                 eq(schema.properties.isPublic, true),
                 isNull(schema.properties.deletedAt),
-                ne(schema.organizations.slug, PLATFORM_ORG_SLUG),
                 ne(schema.organizations.slug, 'sharma-residency')
               )
         );
@@ -122,7 +113,7 @@ async function startServer() {
   app.get('/robots.txt', (req, res) => {
     const baseUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
     res.type('text/plain');
-    res.send(`User-agent: *\nAllow: /\nAllow: /pg/\nDisallow: /dashboard\nDisallow: /tenant\nDisallow: /admin\nSitemap: ${baseUrl}/sitemap.xml\n`);
+    res.send(`User-agent: *\nAllow: /\nAllow: /pg/\nDisallow: /dashboard\nDisallow: /tenant\nSitemap: ${baseUrl}/sitemap.xml\n`);
   });
 
   // Vite middleware in dev, static dist in production
@@ -143,6 +134,13 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`PGDesk server running on http://localhost:${PORT}`);
+    void (async () => {
+      try {
+        await ensureSeeded();
+      } catch (err) {
+        console.error('Startup seed check error:', err instanceof Error ? err.message : err);
+      }
+    })();
   });
 }
 

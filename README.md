@@ -34,5 +34,7 @@ npm run dev      # Starts Express + Vite on http://localhost:3000
 ## Environment Variables
 See `.env.example` for Cloud SQL (`SQL_HOST`, `SQL_DB_NAME`, `SQL_USER`, `SQL_PASSWORD`, `SQL_ADMIN_USER`, `SQL_ADMIN_PASSWORD`), `SESSION_SECRET`, `APP_URL`, and `STORAGE_DRIVER`.
 
-For local demo logins, copy `.env.example` to `.env` and set `ENABLE_DEMO_MODE="true"`.
-This enables the seeded accounts listed above; keep it disabled in production.
+## Authentication (Development / Testing Mode)
+- During development and testing without an external email provider (Resend, SendGrid, or custom SMTP) or SMS gateway, mandatory email confirmation, SMS OTP verification, and self-service email password recovery are disabled (`supabase/config.toml` and `src/lib/authPolicy.ts`).
+- Logged-in users can set or update passwords directly in **Settings -> Password & Security** (without an old password if none was previously set). Organization Owners can reset passwords for Managers and Tenants in their organization from **Settings -> Administrator Password Support (Testing)**.
+- **Production requirement:** Email confirmation and email-based password recovery **must be re-enabled** after a real email delivery provider is configured. See `docs/AUTH_DEVELOPMENT_MODE.md` for full details and security boundaries.

@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LanguageProvider } from './context/LanguageContext';
 import { ToastProvider } from './context/ToastContext';
+import { getDashboardRouteForRole } from './lib/authRoles';
 import { AboutPage, ContactPage, PrivacyPolicyPage, TermsPage } from './pages/InfoPages';
 import { LandingPage } from './pages/LandingPage';
 import { LoginPage } from './pages/LoginPage';
@@ -18,13 +19,12 @@ import { SettingsPage } from './pages/dashboard/SettingsPage';
 import { TenantDetailPage } from './pages/dashboard/TenantDetailPage';
 import { TenantsPage } from './pages/dashboard/TenantsPage';
 import { TenantPortalPage } from './pages/tenant/TenantPortalPage';
-import { AdminDashboardPage } from './pages/admin/AdminDashboardPage';
 
 function RequireRoleRoute({
   allowed,
   children,
 }: {
-  allowed: Array<'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT'>;
+  allowed: Array<'OWNER' | 'MANAGER' | 'TENANT'>;
   children: React.ReactNode;
 }) {
   const { user, loading } = useAuth();
@@ -42,8 +42,7 @@ function RequireRoleRoute({
   }
 
   if (!allowed.includes(user.role)) {
-    const fallback = user.role === 'ADMIN' ? '/admin' : user.role === 'TENANT' ? '/tenant' : '/dashboard';
-    return <Navigate to={fallback} replace />;
+    return <Navigate to={getDashboardRouteForRole(user.role)} replace />;
   }
 
   return <>{children}</>;
@@ -141,15 +140,6 @@ export default function App() {
               element={
                 <RequireRoleRoute allowed={['OWNER', 'MANAGER']}>
                   <SettingsPage />
-                </RequireRoleRoute>
-              }
-            />
-
-            <Route
-              path="/admin"
-              element={
-                <RequireRoleRoute allowed={['ADMIN']}>
-                  <AdminDashboardPage />
                 </RequireRoleRoute>
               }
             />

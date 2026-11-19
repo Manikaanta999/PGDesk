@@ -31,12 +31,12 @@ interface AccountDataResponse {
     email: string;
     phone: string;
     photoUrl: string | null;
-    role: 'ADMIN' | 'OWNER' | 'MANAGER' | 'TENANT';
+    role: 'OWNER' | 'MANAGER' | 'TENANT';
     emailVerified: boolean;
-    phoneVerified?: boolean;
     lastLoginAt: string | null;
     notificationPrefs: NotificationPrefsShape;
     pendingEmail: string | null;
+    pendingPhone: string | null;
     hasPassword: boolean;
     hasGoogleAuth?: boolean;
     signedInWithGoogle?: boolean;
@@ -57,6 +57,12 @@ interface AccountDataResponse {
     entityType: string;
     createdAt: string;
   }>;
+  authPolicy?: {
+    emailVerificationEnabled: boolean;
+    smsOtpEnabled: boolean;
+    passwordResetEmailEnabled: boolean;
+    forgotPasswordMessage: string;
+  };
 }
 
 interface AccountSettingsPanelProps {
@@ -71,20 +77,20 @@ function formatSecurityActionLabel(action: string): string {
       return 'Password changed';
     case 'PASSWORD_RESET':
       return 'Password reset';
+    case 'ADMIN_PASSWORD_RESET':
+      return 'Temporary password set by administrator';
     case 'EMAIL_CHANGED':
       return 'Email address updated';
-    case 'EMAIL_VERIFIED':
-      return 'Email address verified';
-    case 'PHONE_UPDATED':
-      return 'Mobile number updated (unverified)';
-    case 'ADMIN_LOGIN':
-      return 'Admin sign-in';
+    case 'PHONE_CHANGED':
+      return 'Mobile number updated';
     case 'OTHER_SESSIONS_REVOKED':
       return 'Logged out from other devices';
     case 'ACCOUNT_PROFILE_UPDATED':
       return 'Personal profile updated';
     case 'OWNER_REGISTERED':
       return 'Account created';
+    case 'TENANT_OTP_VERIFIED':
+      return 'Account verified';
     case 'STUDENT_MOVE_OUT_REQUESTED':
       return 'Move-out request submitted';
     default:
@@ -93,7 +99,7 @@ function formatSecurityActionLabel(action: string): string {
 }
 
 export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSettingsPanelProps) {
-  const { refreshSession, applySessionToken } = useAuth();
+  const { authPolicy: contextPolicy, refreshSession, applySessionToken } = useAuth();
   const { showToast } = useToast();
 
   const [section, setSection] = useState<'profile' | 'security' | 'notifications'>(initialSection);
@@ -117,9 +123,11 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
   const [emailCode, setEmailCode] = useState('');
   const [emailBusy, setEmailBusy] = useState(false);
 
-  // Direct Phone Update state (stored unverified; no SMS OTP)
-  const [phoneEditOpen, setPhoneEditOpen] = useState(false);
+  // Two-step Phone Change state
+  const [phoneChangeOpen, setPhoneChangeOpen] = useState(false);
   const [newPhone, setNewPhone] = useState('');
+  const [phonePassword, setPhonePassword] = useState('');
+  const [phoneCode, setPhoneCode] = useState('');
   const [phoneBusy, setPhoneBusy] = useState(false);
 
   // Change Password state
@@ -145,7 +153,6 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
       setData(res);
       setName(res.profile.name || '');
       setPhotoUrl(res.profile.photoUrl || null);
-      setNewPhone(res.profile.phone || '');
       setNotifPrefs(sanitizeNotificationPrefs(res.profile.notificationPrefs));
     } catch (err: any) {
       showToast(err.message || 'Could not load account details', 'error');
@@ -207,15 +214,22 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
     e.preventDefault();
     setEmailBusy(true);
     try {
-      const res = await apiFetch<{ message: string }>('/api/account/email-change/request', {
+      const res = await apiFetch<{ message: string; directUpdate?: boolean }>('/api/account/email-change/request', {
         method: 'POST',
         body: JSON.stringify({ currentPassword: emailPassword, newEmail: newEmail.trim() }),
       });
-      showToast(res.message, 'info');
+      showToast(res.message, res.directUpdate ? 'success' : 'info');
       setEmailCode('');
-      await loadAccount();
+      if (res.directUpdate) {
+        setEmailChangeOpen(false);
+        setNewEmail('');
+        setEmailPassword('');
+        await Promise.all([refreshSession(), loadAccount()]);
+      } else {
+        await loadAccount();
+      }
     } catch (err: any) {
-      showToast(err.message || 'Could not start email verification', 'error');
+      showToast(err.message || 'Could not update email address', 'error');
     } finally {
       setEmailBusy(false);
     }
@@ -242,19 +256,47 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
     }
   };
 
-  const handleSaveDirectPhone = async (e: React.FormEvent) => {
+  const handleRequestPhoneChange = async (e: React.FormEvent) => {
     e.preventDefault();
     setPhoneBusy(true);
     try {
-      const res = await apiFetch<{ message?: string }>('/api/account/phone', {
-        method: 'PATCH',
-        body: JSON.stringify({ phone: newPhone.trim() }),
+      const res = await apiFetch<{ message: string; directUpdate?: boolean }>('/api/account/phone-change/request', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword: phonePassword, newPhone: newPhone.trim() }),
       });
-      showToast(res.message || 'Mobile number updated');
-      setPhoneEditOpen(false);
-      await Promise.all([refreshSession(), loadAccount()]);
+      showToast(res.message, res.directUpdate ? 'success' : 'info');
+      setPhoneCode('');
+      if (res.directUpdate) {
+        setPhoneChangeOpen(false);
+        setNewPhone('');
+        setPhonePassword('');
+        await Promise.all([refreshSession(), loadAccount()]);
+      } else {
+        await loadAccount();
+      }
     } catch (err: any) {
       showToast(err.message || 'Could not update mobile number', 'error');
+    } finally {
+      setPhoneBusy(false);
+    }
+  };
+
+  const handleConfirmPhoneChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPhoneBusy(true);
+    try {
+      const res = await apiFetch<{ message: string }>('/api/account/phone-change/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ code: phoneCode.trim() }),
+      });
+      showToast(res.message);
+      setPhoneChangeOpen(false);
+      setNewPhone('');
+      setPhonePassword('');
+      setPhoneCode('');
+      await Promise.all([refreshSession(), loadAccount()]);
+    } catch (err: any) {
+      showToast(err.message || 'Invalid verification code', 'error');
     } finally {
       setPhoneBusy(false);
     }
@@ -348,6 +390,8 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
   }
 
   const { profile, sessions, securityLogs } = data;
+  const emailVerificationEnabled = data.authPolicy?.emailVerificationEnabled ?? contextPolicy.emailVerificationEnabled;
+  const smsOtpEnabled = data.authPolicy?.smsOtpEnabled ?? contextPolicy.smsOtpEnabled;
   const initials = (profile.name || 'U')
     .split(' ')
     .filter(Boolean)
@@ -415,13 +459,11 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
               </div>
               <span className="font-mono text-xs font-semibold text-teal-700 dark:text-teal-400">
                 Role:{' '}
-                {profile.role === 'ADMIN'
-                  ? 'Platform Admin'
-                  : profile.role === 'OWNER'
-                    ? 'Hostel Owner'
-                    : profile.role === 'MANAGER'
-                      ? 'Manager'
-                      : 'Resident'}
+                {profile.role === 'OWNER'
+                  ? 'Hostel Owner'
+                  : profile.role === 'MANAGER'
+                    ? 'Manager'
+                    : 'Resident'}
               </span>
             </div>
 
@@ -495,8 +537,12 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
                   <p className="mt-1.5 font-mono text-sm font-medium text-slate-900 dark:text-white">
                     {profile.email}
                   </p>
-                  <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
-                    {profile.emailVerified ? 'Verified for sign-in and password reset' : 'Verification pending'}
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    {emailVerificationEnabled
+                      ? profile.emailVerified
+                        ? 'Verified for sign-in and password reset'
+                        : 'Verification pending'
+                      : 'Email verification is disabled during testing'}
                   </p>
                 </div>
                 <button
@@ -508,12 +554,15 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
                 </button>
               </div>
 
-              {(emailChangeOpen || profile.pendingEmail) && (
+              {(emailChangeOpen || (emailVerificationEnabled && profile.pendingEmail)) && (
                 <div className="mt-4 space-y-4 border-t border-slate-200 pt-4 dark:border-slate-800">
                   <form onSubmit={handleRequestEmailChange} className="space-y-3">
                     <div>
-                      <label className="block text-xs font-medium">New Email Address</label>
+                      <label htmlFor="acc-new-email" className="block text-xs font-medium">
+                        New Email Address
+                      </label>
                       <input
+                        id="acc-new-email"
                         type="email"
                         required
                         value={newEmail}
@@ -524,8 +573,11 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
                     </div>
                     {profile.hasPassword && (
                       <div>
-                        <label className="block text-xs font-medium">Current Password</label>
+                        <label htmlFor="acc-email-cur-pwd" className="block text-xs font-medium">
+                          Current Password
+                        </label>
                         <input
+                          id="acc-email-cur-pwd"
                           type="password"
                           required
                           value={emailPassword}
@@ -540,11 +592,15 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
                       disabled={emailBusy}
                       className="rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60 dark:bg-teal-700 dark:hover:bg-teal-800"
                     >
-                      {emailBusy ? 'Sending Code...' : 'Send Verification Code'}
+                      {emailBusy
+                        ? 'Updating...'
+                        : emailVerificationEnabled
+                          ? 'Send Verification Code'
+                          : 'Update Email'}
                     </button>
                   </form>
 
-                  {profile.pendingEmail && (
+                  {emailVerificationEnabled && profile.pendingEmail && (
                     <form
                       onSubmit={handleConfirmEmailChange}
                       className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-3.5 dark:border-slate-800 dark:bg-slate-950"
@@ -588,31 +644,24 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
                     {profile.phone ? formatIndianPhone(profile.phone) : 'Not added yet'}
                   </p>
                   <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                    {profile.phone
-                      ? profile.phoneVerified
-                        ? 'Verified contact number'
-                        : 'Unverified contact number (no SMS verification)'
-                      : 'Optional contact number for hostel updates.'}
+                    Used for sign-in and hostel contact updates.
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => {
-                    setNewPhone(profile.phone || '');
-                    setPhoneEditOpen((v) => !v);
-                  }}
+                  onClick={() => setPhoneChangeOpen((v) => !v)}
                   className="shrink-0 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                 >
-                  {phoneEditOpen ? 'Cancel' : profile.phone ? 'Update Mobile' : 'Add Mobile'}
+                  {phoneChangeOpen ? 'Cancel' : 'Change Mobile'}
                 </button>
               </div>
 
-              {phoneEditOpen && (
-                <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
-                  <form onSubmit={handleSaveDirectPhone} className="space-y-3">
+              {(phoneChangeOpen || (smsOtpEnabled && profile.pendingPhone)) && (
+                <div className="mt-4 space-y-4 border-t border-slate-200 pt-4 dark:border-slate-800">
+                  <form onSubmit={handleRequestPhoneChange} className="space-y-3">
                     <div>
                       <label htmlFor="acc-new-phone" className="block text-xs font-medium">
-                        10-Digit Indian Mobile Number
+                        New 10-Digit Mobile Number
                       </label>
                       <input
                         id="acc-new-phone"
@@ -624,14 +673,63 @@ export function AccountSettingsPanel({ initialSection = 'profile' }: AccountSett
                         className={inputClass}
                       />
                     </div>
+                    {profile.hasPassword && (
+                      <div>
+                        <label htmlFor="acc-phone-cur-pwd" className="block text-xs font-medium">
+                          Current Password
+                        </label>
+                        <input
+                          id="acc-phone-cur-pwd"
+                          type="password"
+                          required
+                          value={phonePassword}
+                          onChange={(e) => setPhonePassword(e.target.value)}
+                          placeholder="Confirm your current password"
+                          className={inputClass}
+                        />
+                      </div>
+                    )}
                     <button
                       type="submit"
                       disabled={phoneBusy}
-                      className="rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
+                      className="rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60 dark:bg-teal-700 dark:hover:bg-teal-800"
                     >
-                      {phoneBusy ? 'Saving...' : 'Save Mobile Number'}
+                      {phoneBusy
+                        ? 'Updating...'
+                        : smsOtpEnabled
+                          ? 'Send Verification Code'
+                          : 'Update Mobile'}
                     </button>
                   </form>
+
+                  {smsOtpEnabled && profile.pendingPhone && (
+                    <form
+                      onSubmit={handleConfirmPhoneChange}
+                      className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-3.5 dark:border-slate-800 dark:bg-slate-950"
+                    >
+                      <p className="text-xs text-slate-600 dark:text-slate-400">
+                        Enter the 6-digit verification code for{' '}
+                        <strong className="font-mono text-slate-900 dark:text-white">+91 {profile.pendingPhone}</strong>:
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <input
+                          required
+                          maxLength={6}
+                          value={phoneCode}
+                          onChange={(e) => setPhoneCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                          placeholder="6-digit code"
+                          className="w-36 rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm tracking-widest focus:border-teal-600 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+                        />
+                        <button
+                          type="submit"
+                          disabled={phoneBusy || phoneCode.length !== 6}
+                          className="rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60"
+                        >
+                          Confirm Mobile Number
+                        </button>
+                      </div>
+                    </form>
+                  )}
                 </div>
               )}
             </div>

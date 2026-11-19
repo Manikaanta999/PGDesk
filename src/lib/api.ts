@@ -1,14 +1,28 @@
 import { auth } from './firebase';
 
 const SESSION_TOKEN_KEY = 'pgdesk_token';
+let memorySessionToken: string | null = null;
 
 export function isEmbeddedIframe(): boolean {
   if (typeof window === 'undefined') return false;
   try {
-    return window.self !== window.top;
+    if (window.self !== window.top) return true;
   } catch {
     return true;
   }
+  try {
+    const ref = document.referrer || '';
+    if (
+      ref.includes('aistudio.google.com') ||
+      ref.includes('googleusercontent.com') ||
+      ref.includes('makersuite.google.com')
+    ) {
+      return true;
+    }
+  } catch {
+    // ignore referrer access restrictions
+  }
+  return false;
 }
 
 export function shouldPersistTokenInLocalStorage(): boolean {
@@ -16,24 +30,59 @@ export function shouldPersistTokenInLocalStorage(): boolean {
 }
 
 export function getStoredToken(): string | null {
-  if (typeof window === 'undefined' || !shouldPersistTokenInLocalStorage()) return null;
-  try {
-    return window.localStorage.getItem(SESSION_TOKEN_KEY);
-  } catch {
+  if (typeof window === 'undefined') return null;
+  if (memorySessionToken) return memorySessionToken;
+  if (!shouldPersistTokenInLocalStorage()) {
+    try {
+      const fromSession = window.sessionStorage.getItem(SESSION_TOKEN_KEY);
+      if (fromSession) return fromSession;
+    } catch {
+      // ignore storage errors
+    }
     return null;
   }
+  try {
+    const fromLocal = window.localStorage.getItem(SESSION_TOKEN_KEY);
+    if (fromLocal) return fromLocal;
+  } catch {
+    // ignore localStorage restrictions inside sandboxed iframes
+  }
+  try {
+    const fromSession = window.sessionStorage.getItem(SESSION_TOKEN_KEY);
+    if (fromSession) return fromSession;
+  } catch {
+    // ignore sessionStorage restrictions
+  }
+  return memorySessionToken;
 }
 
 export function setStoredToken(token: string | null) {
+  memorySessionToken = token || null;
   if (typeof window === 'undefined') return;
-  try {
-    if (token && shouldPersistTokenInLocalStorage()) {
-      window.localStorage.setItem(SESSION_TOKEN_KEY, token);
-    } else {
-      window.localStorage.removeItem(SESSION_TOKEN_KEY);
+  if (token) {
+    try {
+      window.sessionStorage.setItem(SESSION_TOKEN_KEY, token);
+    } catch {
+      // ignore storage errors
     }
-  } catch {
-    // ignore storage errors
+    if (shouldPersistTokenInLocalStorage()) {
+      try {
+        window.localStorage.setItem(SESSION_TOKEN_KEY, token);
+      } catch {
+        // ignore storage errors
+      }
+    }
+  } else {
+    try {
+      window.localStorage.removeItem(SESSION_TOKEN_KEY);
+    } catch {
+      // ignore
+    }
+    try {
+      window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -49,6 +98,9 @@ export class ApiError extends Error {
 
 async function buildAuthHeaders(extra?: HeadersInit): Promise<Headers> {
   const headers = new Headers(extra || {});
+  if (isEmbeddedIframe()) {
+    headers.set('X-PGDesk-Embedded', '1');
+  }
   const storedToken = getStoredToken();
   if (storedToken) {
     headers.set('Authorization', `Bearer ${storedToken}`);
@@ -71,27 +123,49 @@ export async function apiFetch<T = any>(url: string, options: RequestInit = {}):
     headers.set('Content-Type', 'application/json');
   }
 
-  const res = await fetch(url, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+  } catch {
+    throw new ApiError(
+      'Unable to reach the PGDesk server. Check your internet connection and try again.',
+      0,
+      { code: 'NETWORK_ERROR' }
+    );
+  }
+
+  const contentType = res.headers.get('content-type') || '';
 
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
     let payload: any;
-    try {
-      payload = await res.json();
-      if (payload?.error) msg = payload.error;
-    } catch {
-      // ignore non-json error
+    if (contentType.includes('application/json')) {
+      try {
+        payload = await res.json();
+        if (payload?.error) msg = payload.error;
+      } catch {
+        // ignore malformed json error
+      }
+    } else if (contentType.includes('text/html')) {
+      msg = 'Unexpected HTML response from server. Please refresh the preview and try again.';
+      payload = { code: 'INVALID_SERVER_RESPONSE' };
     }
     throw new ApiError(msg, res.status, payload);
   }
 
-  const contentType = res.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
     return res.json() as Promise<T>;
+  }
+  if (contentType.includes('text/html') && url.startsWith('/api/')) {
+    throw new ApiError(
+      'API endpoint returned HTML instead of JSON. Please refresh or restart the preview.',
+      502,
+      { code: 'INVALID_SERVER_RESPONSE' }
+    );
   }
   return res.text() as unknown as T;
 }
