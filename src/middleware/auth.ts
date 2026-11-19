@@ -132,8 +132,7 @@ async function loadUserById(userId: number, expectedTokenVersion?: number): Prom
   };
 }
 
-async function isSessionRecordActive(userId: number, sessionId?: string): Promise<boolean> {
-  if (!sessionId) return true;
+async function isSessionRecordActive(userId: number, sessionId: string): Promise<boolean> {
   const rows = await db
     .select({ id: schema.userSessions.id, revokedAt: schema.userSessions.revokedAt, lastSeenAt: schema.userSessions.lastSeenAt })
     .from(schema.userSessions)

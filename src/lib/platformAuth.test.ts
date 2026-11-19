@@ -18,12 +18,24 @@ test('student link code normalization and validation follow strict format', () =
 });
 
 test('session token preserves authMethod claim across SESSION and GOOGLE', () => {
-  const googleTok = signSessionToken({ userId: 3, organizationId: 1, role: 'TENANT', am: 'GOOGLE' });
+  const googleTok = signSessionToken({
+    userId: 3,
+    organizationId: 1,
+    role: 'TENANT',
+    sid: '123e4567-e89b-42d3-a456-426614174000',
+    am: 'GOOGLE',
+  });
   const parsedGoogle = verifySessionToken(googleTok);
   assert.equal(parsedGoogle?.role, 'TENANT');
   assert.equal(parsedGoogle?.am, 'GOOGLE');
 
-  const credTok = signSessionToken({ userId: 1, organizationId: 1, role: 'OWNER', am: 'SESSION' });
+  const credTok = signSessionToken({
+    userId: 1,
+    organizationId: 1,
+    role: 'OWNER',
+    sid: '123e4567-e89b-42d3-a456-426614174001',
+    am: 'SESSION',
+  });
   const parsedCred = verifySessionToken(credTok);
   assert.equal(parsedCred?.role, 'OWNER');
   assert.equal(parsedCred?.am, 'SESSION');

@@ -1,7 +1,60 @@
 import crypto from 'node:crypto';
 
-function getSessionSecret(): string {
-  return process.env.SESSION_SECRET || 'pgdesk-dev-session-secret-change-in-production-2026';
+const KNOWN_INSECURE_SESSION_SECRETS = new Set([
+  'pgdesk-dev-session-secret-change-in-production-2026',
+  'replace-with-32-char-random-secret',
+]);
+
+let processLocalSessionSecret: string | null = null;
+
+function validateProductionSessionSecret(secret: string): void {
+  if (!secret.trim()) {
+    throw new Error('SESSION_SECRET is required in production.');
+  }
+  if (KNOWN_INSECURE_SESSION_SECRETS.has(secret.trim())) {
+    throw new Error('SESSION_SECRET is using a known placeholder value.');
+  }
+
+  if (!/^[A-Za-z0-9_-]+$/.test(secret)) {
+    throw new Error(
+      "SESSION_SECRET must be canonical base64url. Generate it with crypto.randomBytes(32).toString('base64url')."
+    );
+  }
+
+  const decoded = Buffer.from(secret, 'base64url');
+  if (decoded.length !== 32) {
+    throw new Error(
+      "SESSION_SECRET must decode to exactly 32 bytes. Generate it with crypto.randomBytes(32).toString('base64url')."
+    );
+  }
+  if (decoded.toString('base64url') !== secret) {
+    throw new Error(
+      "SESSION_SECRET must be canonical base64url. Generate it with crypto.randomBytes(32).toString('base64url')."
+    );
+  }
+}
+
+export function getSessionSecret(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.SESSION_SECRET;
+  if (configured?.trim()) {
+    if (env.NODE_ENV === 'production') {
+      validateProductionSessionSecret(configured);
+    }
+    return configured.trim();
+  }
+
+  if (env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET is required in production.');
+  }
+
+  if (!processLocalSessionSecret) {
+    processLocalSessionSecret = crypto.randomBytes(32).toString('base64');
+  }
+  return processLocalSessionSecret;
+}
+
+export function validateSessionSecret(env: NodeJS.ProcessEnv = process.env): void {
+  getSessionSecret(env);
 }
 
 export function hashPassword(password: string): string {
@@ -29,12 +82,22 @@ export interface SessionPayload {
   organizationId: number;
   role: 'OWNER' | 'MANAGER' | 'TENANT';
   tv?: number;
-  sid?: string;
+  sid: string;
   am?: 'SESSION' | 'GOOGLE';
   exp: number;
 }
 
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function isValidSessionId(sessionId: unknown): sessionId is string {
+  return typeof sessionId === 'string' && UUID_V4_PATTERN.test(sessionId);
+}
+
 export function signSessionToken(payload: Omit<SessionPayload, 'exp'>, ttlSeconds = 60 * 60 * 24 * 7): string {
+  if (!isValidSessionId(payload.sid)) {
+    throw new Error('A valid UUID session ID is required.');
+  }
   const full: SessionPayload = {
     ...payload,
     exp: Math.floor(Date.now() / 1000) + ttlSeconds,
@@ -55,6 +118,10 @@ export function verifySessionToken(token: string | undefined | null): SessionPay
   try {
     const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as SessionPayload;
     if (!parsed.exp || parsed.exp < Math.floor(Date.now() / 1000)) return null;
+    if (!isValidSessionId(parsed.sid)) return null;
+    if (parsed.role !== 'OWNER' && parsed.role !== 'MANAGER' && parsed.role !== 'TENANT') return null;
+    if (!Number.isInteger(parsed.userId) || parsed.userId <= 0) return null;
+    if (!Number.isInteger(parsed.organizationId) || parsed.organizationId <= 0) return null;
     return parsed;
   } catch {
     return null;

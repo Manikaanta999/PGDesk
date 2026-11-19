@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { db, schema } from './src/db/index.ts';
 import { ensureSeeded } from './src/db/seed.ts';
-import { isDemoModeEnabled } from './src/lib/security.ts';
+import { isDemoModeEnabled, validateSessionSecret } from './src/lib/security.ts';
 import { accountRouter } from './src/server/routes/account.ts';
 import { adminAuthRouter } from './src/server/routes/adminAuth.ts';
 import { authRouter } from './src/server/routes/auth.ts';
@@ -20,6 +20,8 @@ import { tenantPortalRouter } from './src/server/routes/tenantPortal.ts';
 import { tenantsRouter } from './src/server/routes/tenants.ts';
 
 async function startServer() {
+  validateSessionSecret();
+
   const app = express();
   app.set('trust proxy', 1);
   const PORT = 3000;
