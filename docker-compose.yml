@@ -1,0 +1,132 @@
+services:
+  db:
+    image: postgres:16-alpine
+    platform: linux/arm64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?Set POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}
+      PGDESK_APP_USER: ${SQL_USER:?Set SQL_USER}
+      PGDESK_APP_PASSWORD: ${SQL_PASSWORD:?Set SQL_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/10-create-app-role.sql:/docker-entrypoint-initdb.d/10-create-app-role.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - database
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    image: pgdesk:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPPORT_EMAIL: ${VITE_SUPPORT_EMAIL:-}
+        VITE_SUPPORT_PHONE: ${VITE_SUPPORT_PHONE:-}
+    platform: linux/arm64
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      SQL_HOST: db
+      SQL_DB_NAME: ${POSTGRES_DB:?Set POSTGRES_DB}
+      SQL_USER: ${SQL_USER:?Set SQL_USER}
+      SQL_PASSWORD: ${SQL_PASSWORD:?Set SQL_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      APP_URL: ${APP_URL:?Set APP_URL}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?Set FIREBASE_PROJECT_ID}
+      CRON_SECRET: ${CRON_SECRET:?Set CRON_SECRET}
+      ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-false}
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local_db}
+      UPLOAD_DIR: /app/uploads
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_WEBHOOK_URL: ${EMAIL_WEBHOOK_URL:-}
+      EMAIL_WEBHOOK_SECRET: ${EMAIL_WEBHOOK_SECRET:-}
+    expose:
+      - "3000"
+    volumes:
+      - pgdesk_uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - frontend
+      - database
+
+  migrate:
+    image: pgdesk:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPPORT_EMAIL: ${VITE_SUPPORT_EMAIL:-}
+        VITE_SUPPORT_PHONE: ${VITE_SUPPORT_PHONE:-}
+    platform: linux/arm64
+    profiles:
+      - migration
+    restart: "no"
+    command: ["npm", "run", "db:migrate"]
+    environment:
+      SQL_HOST: db
+      SQL_DB_NAME: ${POSTGRES_DB:?Set POSTGRES_DB}
+      SQL_ADMIN_USER: ${POSTGRES_ADMIN_USER:?Set POSTGRES_ADMIN_USER}
+      SQL_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+
+  nginx:
+    image: nginx:1.28-alpine
+    platform: linux/arm64
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN}
+      NGINX_ENVSUBST_FILTER: ^APP_DOMAIN$
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${TLS_CERT_ROOT:?Set TLS_CERT_ROOT}:/etc/letsencrypt:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - frontend
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  frontend:
+    driver: bridge
+  database:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  pgdesk_uploads:

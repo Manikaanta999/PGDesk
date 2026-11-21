@@ -1,5 +1,6 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
+import { parseDatabaseUrl } from './connection.ts';
 import * as schema from './schema.ts';
 
 declare global {
@@ -8,11 +9,28 @@ declare global {
 
 export const createPool = () => {
   if (!global._postgresPool) {
+    const databaseUrl = parseDatabaseUrl();
+    const poolConfig = databaseUrl
+      ? {
+          connectionString: databaseUrl.toString(),
+          ssl: { rejectUnauthorized: true },
+        }
+      : {
+          host: process.env.SQL_HOST,
+          user: process.env.SQL_USER || process.env.SQL_ADMIN_USER,
+          password: process.env.SQL_PASSWORD || process.env.SQL_ADMIN_PASSWORD,
+          database: process.env.SQL_DB_NAME,
+          ssl: false,
+        };
+
+    if (!databaseUrl && (!poolConfig.host || !poolConfig.user || !poolConfig.password || !poolConfig.database)) {
+      throw new Error(
+        'Database configuration is missing. Set DATABASE_URL or SQL_HOST, SQL_DB_NAME, and SQL_USER/SQL_PASSWORD.',
+      );
+    }
+
     global._postgresPool = new Pool({
-      host: process.env.SQL_HOST,
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DB_NAME,
+      ...poolConfig,
       max: 10,
       connectionTimeoutMillis: 15000,
     });

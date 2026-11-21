@@ -32,7 +32,7 @@ npm run dev      # Starts Express + Vite on http://localhost:3000
 ```
 
 ## Environment Variables
-See `.env.example` for Cloud SQL (`SQL_HOST`, `SQL_DB_NAME`, `SQL_USER`, `SQL_PASSWORD`, `SQL_ADMIN_USER`, `SQL_ADMIN_PASSWORD`), `SESSION_SECRET`, `APP_URL`, and `STORAGE_DRIVER`.
+See `.env.example` for PostgreSQL (`DATABASE_URL`, or the legacy `SQL_HOST`, `SQL_DB_NAME`, `SQL_USER`, `SQL_PASSWORD`, `SQL_ADMIN_USER`, and `SQL_ADMIN_PASSWORD` settings), `SESSION_SECRET`, `APP_URL`, and `STORAGE_DRIVER`.
 
 ## Authentication (Development / Testing Mode)
 - During development and testing without an external email provider (Resend, SendGrid, or custom SMTP) or SMS gateway, mandatory email confirmation, SMS OTP verification, and self-service email password recovery are disabled (`supabase/config.toml` and `src/lib/authPolicy.ts`).
