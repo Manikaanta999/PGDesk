@@ -8,6 +8,7 @@ import {
   isRoleAllowedOnPath,
   normalizeLoginIdentifier,
   normalizeUserRole,
+  rethrowAfterGoogleDemoAccessDenied,
 } from './authRoles.ts';
 
 test('normalizeUserRole and getDashboardRouteForRole handle OWNER, MANAGER, TENANT consistently', () => {
@@ -139,4 +140,43 @@ test('classifyAuthError separates network, profile-load, unconfirmed-email, and 
     data: { code: 'AUTH_UNAUTHORIZED_DOMAIN' },
   });
   assert.equal(domainErr.code, 'AUTH_UNAUTHORIZED_DOMAIN');
+});
+
+test('Google demo access rejection signs out Firebase and preserves the backend error', async () => {
+  const message = 'PGDesk is not yet publicly released. Please contact the administrator to request demo access.';
+  const backendError = {
+    status: 403,
+    message,
+    data: { code: 'GOOGLE_DEMO_ACCESS_REQUIRED' },
+  };
+  let signOutCalls = 0;
+
+  await assert.rejects(
+    rethrowAfterGoogleDemoAccessDenied(backendError, async () => {
+      signOutCalls += 1;
+    }),
+    (error) => error === backendError
+  );
+
+  assert.equal(signOutCalls, 1);
+  assert.equal(classifyAuthError(backendError).message, message);
+});
+
+test('Google sign-in does not sign out for network, server, or other authentication errors', async () => {
+  const errors = [
+    { status: 0, message: 'Network failed', data: { code: 'NETWORK_ERROR' } },
+    { status: 500, message: 'Temporary server error', data: { code: 'AUTH_SERVER_ERROR' } },
+    { status: 403, message: 'Email is not verified', data: { code: 'EMAIL_NOT_VERIFIED' } },
+  ];
+
+  for (const error of errors) {
+    let signOutCalls = 0;
+    await assert.rejects(
+      rethrowAfterGoogleDemoAccessDenied(error, async () => {
+        signOutCalls += 1;
+      }),
+      (caughtError) => caughtError === error
+    );
+    assert.equal(signOutCalls, 0);
+  }
 });

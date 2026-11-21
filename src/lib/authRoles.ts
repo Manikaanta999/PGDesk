@@ -112,6 +112,21 @@ export interface ClassifiedAuthError {
   requiresVerification: boolean;
 }
 
+export async function rethrowAfterGoogleDemoAccessDenied(
+  error: unknown,
+  signOut: () => Promise<unknown>
+): Promise<never> {
+  const errorCode = (error as { data?: { code?: unknown } } | null)?.data?.code;
+  if (errorCode === 'GOOGLE_DEMO_ACCESS_REQUIRED') {
+    try {
+      await signOut();
+    } catch (signOutError) {
+      console.error('Failed to sign out rejected Firebase user:', signOutError);
+    }
+  }
+  throw error;
+}
+
 export function classifyAuthError(err: unknown, fallback = 'Sign in failed. Please try again.'): ClassifiedAuthError {
   const anyErr = err as { status?: number; message?: string; data?: { code?: string; requiresOtp?: boolean } } | null;
   const code = String(anyErr?.data?.code || '');

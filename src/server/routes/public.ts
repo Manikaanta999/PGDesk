@@ -5,6 +5,7 @@ import { ensureSeeded } from '../../db/seed.ts';
 import { checkRateLimit, isDemoModeEnabled } from '../../lib/security.ts';
 import { PLATFORM_ORG_SLUG } from '../../lib/platformAuth.ts';
 import { publicEnquirySchema } from '../../lib/validation.ts';
+import { isPublicEnquiryEligible } from './authorization.ts';
 
 export const publicRouter = Router();
 
@@ -179,15 +180,29 @@ publicRouter.post('/enquiries', async (req, res) => {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid enquiry data' });
     }
 
-    const [prop] = await db
-      .select()
+    const demoEnabled = isDemoModeEnabled();
+    const [candidate] = await db
+      .select({
+        property: schema.properties,
+        organizationSlug: schema.organizations.slug,
+      })
       .from(schema.properties)
+      .innerJoin(schema.organizations, eq(schema.organizations.id, schema.properties.organizationId))
       .where(and(eq(schema.properties.id, parsed.data.propertyId), isNull(schema.properties.deletedAt)))
       .limit(1);
 
-    if (!prop) {
+    if (
+      !candidate ||
+      !isPublicEnquiryEligible(
+        candidate.property,
+        candidate.organizationSlug,
+        demoEnabled,
+        PLATFORM_ORG_SLUG
+      )
+    ) {
       return res.status(404).json({ error: 'Selected property was not found' });
     }
+    const prop = candidate.property;
 
     const digits = (parsed.data.phone || '').replace(/\D/g, '');
     const normalizedPhone =

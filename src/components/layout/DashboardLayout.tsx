@@ -165,10 +165,10 @@ export function DashboardLayout({ title, breadcrumb, actions, children }: Dashbo
     .join('');
 
   return (
-    <div className="flex min-h-screen overflow-x-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+    <div className="flex min-h-screen overflow-x-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 lg:h-dvh lg:overflow-hidden">
       {/* Desktop Sidebar */}
-      <aside className="hidden w-64 shrink-0 border-r border-slate-200 lg:block dark:border-slate-800">
-        <div className="sticky top-0 h-screen overflow-y-auto">
+      <aside className="hidden w-64 shrink-0 border-r border-slate-200 lg:block lg:min-h-0 dark:border-slate-800">
+        <div className="sticky top-0 h-dvh overflow-y-auto">
           <div className="flex h-full flex-col justify-between bg-white px-4 py-5 dark:bg-slate-900">
             <div>
               <div className="flex items-center justify-between px-2 pb-5">
@@ -248,7 +248,7 @@ export function DashboardLayout({ title, breadcrumb, actions, children }: Dashbo
       </aside>
 
       {/* Main Content Area */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col lg:min-h-0">
         <header className="flex flex-col gap-3 border-b border-slate-200 bg-white/95 px-4 py-3 sm:sticky sm:top-0 sm:z-20 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-6 sm:backdrop-blur-xs dark:border-slate-800 dark:bg-slate-900/95">
           <div className="flex min-w-0 flex-1 items-center justify-between gap-2">
             <div className="min-w-0 flex-1">
@@ -414,7 +414,7 @@ export function DashboardLayout({ title, breadcrumb, actions, children }: Dashbo
           </div>
         </header>
 
-        <main className="flex-1 p-4 pb-24 sm:p-6 sm:pb-24 lg:p-8 lg:pb-8">{children}</main>
+        <main className="flex-1 p-4 pb-24 sm:p-6 sm:pb-24 lg:min-h-0 lg:overflow-y-auto lg:p-8 lg:pb-8">{children}</main>
       </div>
 
       {/* Mobile & Tablet More Sheet */}

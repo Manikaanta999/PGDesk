@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { and, count, desc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, isNull, or } from 'drizzle-orm';
 import { db, schema } from '../../db/index.ts';
 import { reconcileInvoiceWithPayments } from '../../lib/billing.ts';
 import { getActiveEntitlement, SUBSCRIPTIONS_ENABLED } from '../../lib/entitlements.ts';
@@ -22,6 +22,13 @@ import {
   requireAuth,
   requireRole,
 } from '../../middleware/auth.ts';
+import {
+  canAccessNoticeScope,
+  canAccessOrganizationSettings,
+  parseUploadedFileId,
+  canAccessUploadedFile,
+  resolvePropertyFilter,
+} from './authorization.ts';
 import { logAudit } from '../audit.ts';
 
 export const operationsRouter = Router();
@@ -48,32 +55,81 @@ operationsRouter.get('/complaints', requireAuth, requireRole('OWNER', 'MANAGER')
           )
         )
         .orderBy(desc(schema.complaints.createdAt)),
-      db.select().from(schema.tenants).where(eq(schema.tenants.organizationId, user.organizationId)),
-      db.select().from(schema.beds).where(eq(schema.beds.organizationId, user.organizationId)),
-      db.select().from(schema.rooms).where(eq(schema.rooms.organizationId, user.organizationId)),
+      db
+        .select()
+        .from(schema.tenants)
+        .where(
+          and(
+            eq(schema.tenants.organizationId, user.organizationId),
+            inArray(schema.tenants.propertyId, allowedIds),
+            isNull(schema.tenants.deletedAt)
+          )
+        ),
+      db
+        .select()
+        .from(schema.beds)
+        .where(
+          and(
+            eq(schema.beds.organizationId, user.organizationId),
+            inArray(schema.beds.propertyId, allowedIds)
+          )
+        ),
+      db
+        .select()
+        .from(schema.rooms)
+        .where(
+          and(
+            eq(schema.rooms.organizationId, user.organizationId),
+            inArray(schema.rooms.propertyId, allowedIds)
+          )
+        ),
       db
         .select({
           id: schema.users.id,
           name: schema.users.name,
           role: schema.users.role,
+          assignedPropertyIds: schema.users.assignedPropertyIds,
         })
         .from(schema.users)
         .where(eq(schema.users.organizationId, user.organizationId)),
       db
         .select()
         .from(schema.complaintComments)
-        .where(eq(schema.complaintComments.organizationId, user.organizationId))
+        .where(
+          and(
+            eq(schema.complaintComments.organizationId, user.organizationId),
+            inArray(
+              schema.complaintComments.complaintId,
+              db
+                .select({ id: schema.complaints.id })
+                .from(schema.complaints)
+                .where(
+                  and(
+                    eq(schema.complaints.organizationId, user.organizationId),
+                    inArray(schema.complaints.propertyId, allowedIds)
+                  )
+                )
+            )
+          )
+        )
         .orderBy(schema.complaintComments.createdAt),
     ]);
 
+    const visibleStaff = staff.filter(
+      (member) =>
+        user.role === 'OWNER' ||
+        member.role === 'OWNER' ||
+        member.assignedPropertyIds.some((id) => allowedIds.includes(id))
+    );
     const propMap = new Map(orgProps.map((p) => [p.id, p]));
     const tenantMap = new Map(tenants.map((t) => [t.id, t]));
     const bedMap = new Map(beds.map((b) => [b.id, b]));
-    const roomMap = new Map(rooms.map((r) => [r.id, r]));
-    const staffMap = new Map(staff.map((s) => [s.id, s]));
+    const roomMap = new Map(rooms.map((room) => [room.id, room]));
+    const staffMap = new Map(visibleStaff.map((member) => [member.id, member]));
 
     const enriched = rows.map((c) => {
-      const tenant = tenantMap.get(c.tenantId);
+      const tenantCandidate = tenantMap.get(c.tenantId);
+      const tenant = tenantCandidate?.propertyId === c.propertyId ? tenantCandidate : undefined;
       const bed = tenant?.bedId ? bedMap.get(tenant.bedId) : undefined;
       const room = bed ? roomMap.get(bed.roomId) : undefined;
       return {
@@ -90,7 +146,9 @@ operationsRouter.get('/complaints', requireAuth, requireRole('OWNER', 'MANAGER')
 
     return res.json({
       complaints: enriched,
-      staff: staff.filter((s) => s.role === 'OWNER' || s.role === 'MANAGER'),
+      staff: visibleStaff
+        .filter((member) => member.role === 'OWNER' || member.role === 'MANAGER')
+        .map(({ id, name, role }) => ({ id, name, role })),
     });
   } catch (err) {
     console.error('GET /api/complaints error:', err);
@@ -249,7 +307,7 @@ operationsRouter.post('/notices', requireAuth, requireRole('OWNER', 'MANAGER'), 
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid notice' });
     }
-    if (parsed.data.propertyId && !canAccessProperty(user, parsed.data.propertyId)) {
+    if (!canAccessNoticeScope(user, parsed.data.propertyId ?? null)) {
       return res.status(403).json({ error: 'Access denied to target property' });
     }
 
@@ -283,7 +341,7 @@ operationsRouter.patch('/notices/:id', requireAuth, requireRole('OWNER', 'MANAGE
       .where(and(eq(schema.notices.id, id), eq(schema.notices.organizationId, user.organizationId)))
       .limit(1);
     if (!existing) return res.status(404).json({ error: 'Notice not found' });
-    if (existing.propertyId && !canAccessProperty(user, existing.propertyId)) {
+    if (!canAccessNoticeScope(user, existing.propertyId)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -291,7 +349,8 @@ operationsRouter.patch('/notices/:id', requireAuth, requireRole('OWNER', 'MANAGE
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid notice update' });
     }
-    if (parsed.data.propertyId && !canAccessProperty(user, parsed.data.propertyId)) {
+    const targetPropertyId = parsed.data.propertyId !== undefined ? parsed.data.propertyId : existing.propertyId;
+    if (!canAccessNoticeScope(user, targetPropertyId)) {
       return res.status(403).json({ error: 'Access denied to target property' });
     }
 
@@ -324,7 +383,7 @@ operationsRouter.delete('/notices/:id', requireAuth, requireRole('OWNER', 'MANAG
       .where(and(eq(schema.notices.id, id), eq(schema.notices.organizationId, user.organizationId)))
       .limit(1);
     if (!existing) return res.status(404).json({ error: 'Notice not found' });
-    if (existing.propertyId && !canAccessProperty(user, existing.propertyId)) {
+    if (!canAccessNoticeScope(user, existing.propertyId)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -411,13 +470,19 @@ operationsRouter.patch('/enquiries/:id', requireAuth, requireRole('OWNER', 'MANA
 operationsRouter.get('/expenses', requireAuth, requireRole('OWNER', 'MANAGER'), async (req: AuthRequest, res) => {
   try {
     const user = req.user!;
-    const propertyId = req.query.propertyId ? Number(req.query.propertyId) : null;
     const props = await db
       .select()
       .from(schema.properties)
       .where(and(eq(schema.properties.organizationId, user.organizationId), isNull(schema.properties.deletedAt)));
     const allowedIds = getAllowedPropertyIds(user, props.map((p) => p.id));
-    const targetIds = propertyId && allowedIds.includes(propertyId) ? [propertyId] : allowedIds;
+    const propertyFilter = resolvePropertyFilter(req.query.propertyId, allowedIds);
+    if (propertyFilter.kind === 'invalid') {
+      return res.status(400).json({ error: 'Invalid propertyId filter' });
+    }
+    if (propertyFilter.kind === 'forbidden') {
+      return res.status(403).json({ error: 'Access denied to this property' });
+    }
+    const targetIds = propertyFilter.kind === 'selected' ? [propertyFilter.propertyId] : allowedIds;
     if (targetIds.length === 0) return res.json({ expenses: [], pnl: [] });
 
     const [expenseRows, invoiceRows, approvedPaymentRows] = await Promise.all([
@@ -540,13 +605,19 @@ operationsRouter.post('/expenses', requireAuth, requireRole('OWNER', 'MANAGER'),
 operationsRouter.get('/reports/pnl.csv', requireAuth, requireRole('OWNER', 'MANAGER'), async (req: AuthRequest, res) => {
   try {
     const user = req.user!;
-    const propertyId = req.query.propertyId ? Number(req.query.propertyId) : null;
     const props = await db
       .select()
       .from(schema.properties)
       .where(and(eq(schema.properties.organizationId, user.organizationId), isNull(schema.properties.deletedAt)));
     const allowedIds = getAllowedPropertyIds(user, props.map((p) => p.id));
-    const targetIds = propertyId && allowedIds.includes(propertyId) ? [propertyId] : allowedIds;
+    const propertyFilter = resolvePropertyFilter(req.query.propertyId, allowedIds);
+    if (propertyFilter.kind === 'invalid') {
+      return res.status(400).json({ error: 'Invalid propertyId filter' });
+    }
+    if (propertyFilter.kind === 'forbidden') {
+      return res.status(403).json({ error: 'Access denied to this property' });
+    }
+    const targetIds = propertyFilter.kind === 'selected' ? [propertyFilter.propertyId] : allowedIds;
 
     if (targetIds.length === 0) {
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -609,9 +680,13 @@ operationsRouter.get('/reports/pnl.csv', requireAuth, requireRole('OWNER', 'MANA
 });
 
 // ---------- SETTINGS & STAFF (OWNER ONLY FOR SENSITIVE CHANGES) ----------
-operationsRouter.get('/settings', requireAuth, requireRole('OWNER', 'MANAGER'), async (req: AuthRequest, res) => {
+operationsRouter.get('/settings', requireAuth, async (req: AuthRequest, res) => {
+  const user = req.user!;
+  if (!canAccessOrganizationSettings(user.role)) {
+    return res.status(403).json({ error: 'Insufficient permissions for this action' });
+  }
+
   try {
-    const user = req.user!;
     const [org] = await db
       .select()
       .from(schema.organizations)
@@ -817,30 +892,104 @@ operationsRouter.post('/files/upload', requireAuth, async (req: AuthRequest, res
 operationsRouter.get('/files/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
     const user = req.user!;
-    const fileId = Number(req.params.id);
+    const fileId = parseUploadedFileId(`/api/files/${req.params.id}`);
+    if (fileId === null) {
+      return res.status(400).json({ error: 'Invalid file ID' });
+    }
+
     const [file] = await db
       .select()
       .from(schema.uploadedFiles)
-      .where(eq(schema.uploadedFiles.id, fileId))
+      .where(
+        and(
+          eq(schema.uploadedFiles.id, fileId),
+          eq(schema.uploadedFiles.organizationId, user.organizationId)
+        )
+      )
       .limit(1);
 
     if (!file) return res.status(404).json({ error: 'File not found' });
 
-    if (user.role !== 'TENANT') {
-      if (file.organizationId !== user.organizationId) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-    } else if (file.isPrivate && file.ownerUserId !== user.id) {
-      const ownTenants = await db
-        .select({ idDocumentUrl: schema.tenants.idDocumentUrl })
-        .from(schema.tenants)
-        .where(and(eq(schema.tenants.userId, user.id), isNull(schema.tenants.deletedAt)));
-      const matches = ownTenants.some((t) => t.idDocumentUrl === `/api/files/${file.id}`);
-      if (!matches) {
-        return res.status(403).json({ error: 'Access denied to private ID document' });
-      }
-    } else if (!file.isPrivate && file.organizationId !== user.organizationId && file.ownerUserId !== user.id) {
-      return res.status(404).json({ error: 'File not found' });
+    const linkedRecords: Array<{ userId: number | null; propertyId: number }> = await db
+      .select({ userId: schema.tenants.userId, propertyId: schema.tenants.propertyId })
+      .from(schema.uploadedFiles)
+      .innerJoin(schema.tenants, eq(schema.tenants.id, schema.uploadedFiles.tenantId))
+      .where(
+        and(
+          eq(schema.uploadedFiles.id, file.id),
+          eq(schema.uploadedFiles.organizationId, user.organizationId),
+          eq(schema.tenants.organizationId, user.organizationId),
+          isNull(schema.tenants.deletedAt)
+        )
+      );
+
+    if (!file.isPrivate && user.role !== 'OWNER') {
+      const [complaintRecords, paymentRecords, properties] = await Promise.all([
+        db
+          .select({ userId: schema.tenants.userId, propertyId: schema.complaints.propertyId })
+          .from(schema.complaints)
+          .innerJoin(
+            schema.tenants,
+            and(
+              eq(schema.tenants.id, schema.complaints.tenantId),
+              eq(schema.tenants.organizationId, schema.complaints.organizationId),
+              eq(schema.tenants.propertyId, schema.complaints.propertyId),
+              isNull(schema.tenants.deletedAt)
+            )
+          )
+          .where(
+            and(
+              eq(schema.complaints.organizationId, user.organizationId),
+              eq(schema.complaints.photoUrl, `/api/files/${file.id}`)
+            )
+          ),
+        db
+          .select({ userId: schema.tenants.userId, propertyId: schema.invoices.propertyId })
+          .from(schema.payments)
+          .innerJoin(
+            schema.invoices,
+            and(
+              eq(schema.invoices.id, schema.payments.invoiceId),
+              eq(schema.invoices.organizationId, schema.payments.organizationId),
+              eq(schema.invoices.tenantId, schema.payments.tenantId)
+            )
+          )
+          .innerJoin(
+            schema.tenants,
+            and(
+              eq(schema.tenants.id, schema.payments.tenantId),
+              eq(schema.tenants.organizationId, schema.payments.organizationId),
+              eq(schema.tenants.propertyId, schema.invoices.propertyId),
+              isNull(schema.tenants.deletedAt)
+            )
+          )
+          .where(
+            and(
+              eq(schema.payments.organizationId, user.organizationId),
+              eq(schema.payments.screenshotUrl, `/api/files/${file.id}`)
+            )
+          ),
+        db
+          .select({ id: schema.properties.id, photos: schema.properties.photos })
+          .from(schema.properties)
+          .where(
+            and(
+              eq(schema.properties.organizationId, user.organizationId),
+              isNull(schema.properties.deletedAt)
+            )
+          ),
+      ]);
+
+      linkedRecords.push(...complaintRecords, ...paymentRecords);
+      linkedRecords.push(
+        ...properties
+          .filter((property) => property.photos.includes(`/api/files/${file.id}`))
+          .map((property) => ({ userId: null, propertyId: property.id }))
+      );
+    }
+
+    if (!canAccessUploadedFile(user, file, linkedRecords)) {
+      return res.status(403).json({ error: 'Access denied to file' });
     }
 
     if ((file.provider === 'gcs' || file.provider === 's3') && storageService.getSignedDownloadUrl) {

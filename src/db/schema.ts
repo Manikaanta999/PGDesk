@@ -584,6 +584,7 @@ export const uploadedFiles = pgTable(
       .references(() => organizations.id)
       .notNull(),
     ownerUserId: integer('owner_user_id').references(() => users.id),
+    tenantId: integer('tenant_id').references(() => tenants.id),
     fileName: text('file_name').notNull(),
     mimeType: text('mime_type').notNull(),
     sizeBytes: integer('size_bytes').notNull(),
@@ -594,7 +595,10 @@ export const uploadedFiles = pgTable(
     isPrivate: boolean('is_private').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
-  (table) => [index('uploaded_files_org_idx').on(table.organizationId)]
+  (table) => [
+    index('uploaded_files_org_idx').on(table.organizationId),
+    index('uploaded_files_tenant_idx').on(table.tenantId),
+  ]
 );
 
 export const moveOutRequests = pgTable(

@@ -16,6 +16,7 @@ import {
   requireAuth,
   requireRole,
 } from '../../middleware/auth.ts';
+import { floorBelongsToProperty } from './authorization.ts';
 import { logAudit } from '../audit.ts';
 
 export const propertiesRouter = Router();
@@ -38,15 +39,28 @@ propertiesRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (r
 
     const allowedIds = new Set(getAllowedPropertyIds(user, orgProps.map((p) => p.id)));
     const visibleProps = orgProps.filter((p) => allowedIds.has(p.id));
+    if (visibleProps.length === 0) {
+      return res.json({ properties: [] });
+    }
 
     const allBeds = await db
       .select()
       .from(schema.beds)
-      .where(eq(schema.beds.organizationId, user.organizationId));
+      .where(
+        and(
+          eq(schema.beds.organizationId, user.organizationId),
+          inArray(schema.beds.propertyId, [...allowedIds])
+        )
+      );
     const allRooms = await db
       .select()
       .from(schema.rooms)
-      .where(eq(schema.rooms.organizationId, user.organizationId));
+      .where(
+        and(
+          eq(schema.rooms.organizationId, user.organizationId),
+          inArray(schema.rooms.propertyId, [...allowedIds])
+        )
+      );
 
     const enriched = visibleProps.map((p) => {
       const pBeds = allBeds.filter((b) => b.propertyId === p.id);
@@ -381,6 +395,21 @@ propertiesRouter.post('/:id/rooms', requireAuth, requireRole('OWNER', 'MANAGER')
     const parsed = createRoomSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid room data' });
+    }
+
+    const [floor] = await db
+      .select()
+      .from(schema.floors)
+      .where(
+        and(
+          eq(schema.floors.id, parsed.data.floorId),
+          eq(schema.floors.propertyId, propId),
+          eq(schema.floors.organizationId, user.organizationId)
+        )
+      )
+      .limit(1);
+    if (!floorBelongsToProperty(floor, user.organizationId, propId)) {
+      return res.status(404).json({ error: 'Selected floor not found in this property' });
     }
 
     const defaultBedCount =

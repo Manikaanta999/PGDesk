@@ -20,6 +20,12 @@ import {
   requireAuth,
   requireRole,
 } from '../../middleware/auth.ts';
+import {
+  canAssociateTenantDocument,
+  canLinkAdmissionUser,
+  parseUploadedFileId,
+  resolvePropertyFilter,
+} from './authorization.ts';
 import { logAudit } from '../audit.ts';
 import { allocateNextFyInvoiceNumber } from '../billingEngine.ts';
 
@@ -40,7 +46,6 @@ tenantsRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req:
     const pageSize = Math.min(100, Math.max(5, Number(req.query.pageSize || 20)));
     const search = String(req.query.search || '').trim().toLowerCase();
     const statusFilter = String(req.query.status || 'ALL').toUpperCase();
-    const propertyIdFilter = req.query.propertyId ? Number(req.query.propertyId) : null;
     const dueOnly = String(req.query.dueOnly || 'false') === 'true';
 
     const orgProps = await db
@@ -49,6 +54,14 @@ tenantsRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req:
       .where(and(eq(schema.properties.organizationId, user.organizationId), isNull(schema.properties.deletedAt)));
 
     const allowedIds = getAllowedPropertyIds(user, orgProps.map((p) => p.id));
+    const propertyFilter = resolvePropertyFilter(req.query.propertyId, allowedIds);
+    if (propertyFilter.kind === 'invalid') {
+      return res.status(400).json({ error: 'Invalid propertyId filter' });
+    }
+    if (propertyFilter.kind === 'forbidden') {
+      return res.status(403).json({ error: 'Access denied to this property' });
+    }
+    const propertyIdFilter = propertyFilter.kind === 'selected' ? propertyFilter.propertyId : null;
     if (allowedIds.length === 0) {
       return res.json({ tenants: [], total: 0, page, pageSize });
     }
@@ -65,15 +78,51 @@ tenantsRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req:
           )
         )
         .orderBy(desc(schema.tenants.createdAt)),
-      db.select().from(schema.beds).where(eq(schema.beds.organizationId, user.organizationId)),
-      db.select().from(schema.rooms).where(eq(schema.rooms.organizationId, user.organizationId)),
-      db.select().from(schema.invoices).where(eq(schema.invoices.organizationId, user.organizationId)),
+      db
+        .select()
+        .from(schema.beds)
+        .where(
+          and(
+            eq(schema.beds.organizationId, user.organizationId),
+            inArray(schema.beds.propertyId, allowedIds)
+          )
+        ),
+      db
+        .select()
+        .from(schema.rooms)
+        .where(
+          and(
+            eq(schema.rooms.organizationId, user.organizationId),
+            inArray(schema.rooms.propertyId, allowedIds)
+          )
+        ),
+      db
+        .select()
+        .from(schema.invoices)
+        .where(
+          and(
+            eq(schema.invoices.organizationId, user.organizationId),
+            inArray(schema.invoices.propertyId, allowedIds)
+          )
+        ),
       db
         .select()
         .from(schema.payments)
         .where(
           and(
             eq(schema.payments.organizationId, user.organizationId),
+            inArray(
+              schema.payments.invoiceId,
+              db
+                .select({ id: schema.invoices.id })
+                .from(schema.invoices)
+                .where(
+                  and(
+                    eq(schema.invoices.organizationId, user.organizationId),
+                    inArray(schema.invoices.propertyId, allowedIds)
+                  )
+                )
+            ),
             eq(schema.payments.approvalStatus, 'APPROVED')
           )
         ),
@@ -195,8 +244,30 @@ tenantsRouter.post('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req
       : '';
     const emailLower = data.email ? data.email.trim().toLowerCase() : null;
     const todayStr = new Date().toISOString().slice(0, 10);
+    const idDocumentFileId = data.idDocumentUrl ? parseUploadedFileId(data.idDocumentUrl) : null;
+    if (data.idDocumentUrl && idDocumentFileId === null) {
+      return res.status(400).json({ error: 'ID documents must be uploaded before they can be assigned' });
+    }
 
     const result = await db.transaction(async (tx) => {
+      if (idDocumentFileId !== null) {
+        const [file] = await tx
+          .select()
+          .from(schema.uploadedFiles)
+          .where(eq(schema.uploadedFiles.id, idDocumentFileId))
+          .for('update')
+          .limit(1);
+        if (
+          !file ||
+          file.organizationId !== user.organizationId ||
+          file.ownerUserId !== user.id ||
+          !file.isPrivate ||
+          file.tenantId !== null
+        ) {
+          throw new AdmissionHttpError(403, 'Only your own unassigned ID document can be linked to a tenant.');
+        }
+      }
+
       if (data.idempotencyKey) {
         const [dupPay] = await tx
           .select({ id: schema.payments.id })
@@ -242,46 +313,36 @@ tenantsRouter.post('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req
         .select()
         .from(schema.users)
         .where(
-          emailLower
-            ? or(eq(schema.users.email, emailLower), eq(schema.users.phone, cleanPhone))
-            : eq(schema.users.phone, cleanPhone)
+          and(
+            eq(schema.users.organizationId, user.organizationId),
+            emailLower
+              ? or(eq(schema.users.email, emailLower), eq(schema.users.phone, cleanPhone))
+              : eq(schema.users.phone, cleanPhone)
+          )
         )
-        .limit(1);
+        .limit(2)
+        .for('update');
 
       if (matchedUsers[0]) {
+        if (matchedUsers.length > 1 || !canLinkAdmissionUser(matchedUsers[0], user.organizationId)) {
+          throw new AdmissionHttpError(409, 'A matching account cannot be linked to this tenant.');
+        }
         const existingUser = matchedUsers[0];
         linkedUserId = existingUser.id;
-        if (existingUser.role === 'TENANT') {
-          const existingActiveStay = await tx
-            .select({ id: schema.tenants.id })
-            .from(schema.tenants)
-            .where(
-              and(
-                eq(schema.tenants.userId, existingUser.id),
-                eq(schema.tenants.organizationId, existingUser.organizationId),
-                inArray(schema.tenants.status, ['ACTIVE', 'NOTICE']),
-                isNull(schema.tenants.deletedAt)
-              )
+        const nextPropIds = Array.from(new Set([...existingUser.assignedPropertyIds, data.propertyId]));
+        const [linkedUser] = await tx
+          .update(schema.users)
+          .set({ assignedPropertyIds: nextPropIds, updatedAt: new Date() })
+          .where(
+            and(
+              eq(schema.users.id, existingUser.id),
+              eq(schema.users.organizationId, user.organizationId),
+              eq(schema.users.role, 'TENANT')
             )
-            .limit(1);
-
-          const shouldReassignOrg = existingUser.organizationId === user.organizationId || !existingActiveStay[0];
-          if (shouldReassignOrg) {
-            const nextPropIds = Array.from(
-              new Set([
-                ...(existingUser.organizationId === user.organizationId ? existingUser.assignedPropertyIds : []),
-                data.propertyId,
-              ])
-            );
-            await tx
-              .update(schema.users)
-              .set({
-                organizationId: user.organizationId,
-                assignedPropertyIds: nextPropIds,
-                updatedAt: new Date(),
-              })
-              .where(eq(schema.users.id, existingUser.id));
-          }
+          )
+          .returning({ id: schema.users.id });
+        if (!linkedUser) {
+          throw new AdmissionHttpError(409, 'A matching account cannot be linked to this tenant.');
         }
       } else if (emailLower) {
         const [portalUser] = await tx
@@ -297,8 +358,9 @@ tenantsRouter.post('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req
             isActive: true,
             emailVerified: true,
           })
+          .onConflictDoNothing({ target: schema.users.email })
           .returning();
-        linkedUserId = portalUser.id;
+        linkedUserId = portalUser?.id ?? null;
       }
 
       const [tenant] = await tx
@@ -326,6 +388,25 @@ tenantsRouter.post('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (req
           depositStatus: 'HELD',
         })
         .returning();
+
+      if (idDocumentFileId !== null) {
+        const [associatedFile] = await tx
+          .update(schema.uploadedFiles)
+          .set({ tenantId: tenant.id })
+          .where(
+            and(
+              eq(schema.uploadedFiles.id, idDocumentFileId),
+              eq(schema.uploadedFiles.organizationId, tenant.organizationId),
+              eq(schema.uploadedFiles.ownerUserId, user.id),
+              eq(schema.uploadedFiles.isPrivate, true),
+              isNull(schema.uploadedFiles.tenantId)
+            )
+          )
+          .returning({ id: schema.uploadedFiles.id });
+        if (!associatedFile) {
+          throw new AdmissionHttpError(409, 'ID document association changed while creating the tenant.');
+        }
+      }
 
       await tx
         .update(schema.beds)
@@ -597,30 +678,87 @@ tenantsRouter.patch('/:id', requireAuth, requireRole('OWNER', 'MANAGER'), async 
     const nextEmergencyPhone = d.emergencyContactPhone
       ? d.emergencyContactPhone.replace(/\D/g, '').slice(-10)
       : '';
+    const documentChanged = d.idDocumentUrl !== undefined && d.idDocumentUrl !== tenant.idDocumentUrl;
+    const nextDocumentUrl = d.idDocumentUrl || null;
+    let nextDocumentFileId: number | null = null;
+    if (documentChanged && nextDocumentUrl) {
+      nextDocumentFileId = parseUploadedFileId(nextDocumentUrl);
+      if (nextDocumentFileId === null) {
+        return res.status(400).json({ error: 'ID documents must be uploaded before they can be assigned' });
+      }
 
-    const [updated] = await db
-      .update(schema.tenants)
-      .set({
-        name: d.name,
-        phone: nextPhone,
-        ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
-        ...(d.dateOfBirth !== undefined ? { dateOfBirth: d.dateOfBirth || null } : {}),
-        occupation: d.occupation || tenant.occupation,
-        companyOrCollege: d.companyOrCollege ?? '',
-        permanentAddress: d.permanentAddress ?? '',
-        emergencyContactName: d.emergencyContactName ?? '',
-        emergencyContactRelation: d.emergencyContactRelation ?? tenant.emergencyContactRelation ?? '',
-        emergencyContactPhone: nextEmergencyPhone,
-        idType: d.idType || tenant.idType,
-        idNumberMasked: d.idNumberMasked ?? '',
-        idDocumentUrl: d.idDocumentUrl !== undefined ? d.idDocumentUrl : tenant.idDocumentUrl,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.tenants.id, tenant.id))
-      .returning();
+      const [file] = await db
+        .select()
+        .from(schema.uploadedFiles)
+        .where(eq(schema.uploadedFiles.id, nextDocumentFileId))
+        .limit(1);
+      if (!file || !canAssociateTenantDocument(user, tenant, file)) {
+        return res.status(403).json({ error: 'Only your own uploaded ID documents can be assigned to a tenant' });
+      }
+    }
+
+    const [updated] = await db.transaction(async (tx) => {
+      if (documentChanged) {
+        const previousFileId = parseUploadedFileId(tenant.idDocumentUrl);
+        if (previousFileId !== null) {
+          await tx
+            .update(schema.uploadedFiles)
+            .set({ tenantId: null })
+            .where(
+              and(
+                eq(schema.uploadedFiles.id, previousFileId),
+                eq(schema.uploadedFiles.tenantId, tenant.id)
+              )
+            );
+        }
+
+        if (nextDocumentFileId !== null) {
+          const [associatedFile] = await tx
+            .update(schema.uploadedFiles)
+            .set({ tenantId: tenant.id })
+            .where(
+              and(
+                eq(schema.uploadedFiles.id, nextDocumentFileId),
+                eq(schema.uploadedFiles.organizationId, tenant.organizationId),
+                eq(schema.uploadedFiles.ownerUserId, user.id),
+                eq(schema.uploadedFiles.isPrivate, true),
+                or(isNull(schema.uploadedFiles.tenantId), eq(schema.uploadedFiles.tenantId, tenant.id))
+              )
+            )
+            .returning({ id: schema.uploadedFiles.id });
+          if (!associatedFile) {
+            throw new AdmissionHttpError(409, 'ID document association changed while updating the tenant.');
+          }
+        }
+      }
+
+      return tx
+        .update(schema.tenants)
+        .set({
+          name: d.name,
+          phone: nextPhone,
+          ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
+          ...(d.dateOfBirth !== undefined ? { dateOfBirth: d.dateOfBirth || null } : {}),
+          occupation: d.occupation || tenant.occupation,
+          companyOrCollege: d.companyOrCollege ?? '',
+          permanentAddress: d.permanentAddress ?? '',
+          emergencyContactName: d.emergencyContactName ?? '',
+          emergencyContactRelation: d.emergencyContactRelation ?? tenant.emergencyContactRelation ?? '',
+          emergencyContactPhone: nextEmergencyPhone,
+          idType: d.idType || tenant.idType,
+          idNumberMasked: d.idNumberMasked ?? '',
+          idDocumentUrl: d.idDocumentUrl !== undefined ? d.idDocumentUrl : tenant.idDocumentUrl,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.tenants.id, tenant.id))
+        .returning();
+    });
 
     return res.json({ tenant: updated });
   } catch (err) {
+    if (err instanceof AdmissionHttpError) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('PATCH /api/tenants/:id error:', err);
     return res.status(500).json({ error: 'Failed to update tenant profile' });
   }

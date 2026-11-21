@@ -2,7 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useRef, useSt
 import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut } from 'firebase/auth';
 import { ApiError, apiFetch, getStoredToken, setStoredToken } from '../lib/api';
 import { AuthTestingPolicy, FORGOT_PASSWORD_UNAVAILABLE_MESSAGE } from '../lib/authPolicy';
-import { AppUserRole } from '../lib/authRoles';
+import { AppUserRole, rethrowAfterGoogleDemoAccessDenied } from '../lib/authRoles';
 import { auth, googleAuthProvider } from '../lib/firebase';
 
 export interface SessionUser {
@@ -325,6 +325,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!auth || !googleAuthProvider) {
       throw new Error('Google Sign-In is not configured for this deployment.');
     }
+    const firebaseAuth = auth;
     manualAuthBusyRef.current = true;
     try {
       setStoredToken(null);
@@ -349,7 +350,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         throw fbErr;
       }
-      const resolvedUser = await refreshSession(true);
+      const resolvedUser = await refreshSession(true).catch((error: unknown) =>
+        rethrowAfterGoogleDemoAccessDenied(error, () => firebaseSignOut(firebaseAuth))
+      );
       if (!resolvedUser) {
         throw new ApiError(
           'Login successful, but your account profile could not be loaded. Please contact support.',

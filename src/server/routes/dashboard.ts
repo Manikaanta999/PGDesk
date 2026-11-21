@@ -4,6 +4,7 @@ import { db, schema } from '../../db/index.ts';
 import { reconcileInvoiceWithPayments } from '../../lib/billing.ts';
 import { formatMonthYear } from '../../lib/format.ts';
 import { AuthRequest, getAllowedPropertyIds, requireAuth, requireRole } from '../../middleware/auth.ts';
+import { resolvePropertyFilter } from './authorization.ts';
 
 export const dashboardRouter = Router();
 
@@ -11,7 +12,6 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
   try {
     const user = req.user!;
     const orgId = user.organizationId;
-    const filterPropertyId = req.query.propertyId ? Number(req.query.propertyId) : null;
 
     const orgProperties = await db
       .select()
@@ -22,8 +22,14 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
       user,
       orgProperties.map((p) => p.id)
     );
-    const activePropertyIds =
-      filterPropertyId && allowedIds.includes(filterPropertyId) ? [filterPropertyId] : allowedIds;
+    const propertyFilter = resolvePropertyFilter(req.query.propertyId, allowedIds);
+    if (propertyFilter.kind === 'invalid') {
+      return res.status(400).json({ error: 'Invalid propertyId filter' });
+    }
+    if (propertyFilter.kind === 'forbidden') {
+      return res.status(403).json({ error: 'Access denied to this property' });
+    }
+    const activePropertyIds = propertyFilter.kind === 'selected' ? [propertyFilter.propertyId] : allowedIds;
 
     if (activePropertyIds.length === 0) {
       return res.json({
@@ -59,7 +65,7 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
           newEnquiries: [],
           maintenanceBeds: [],
         },
-        properties: orgProperties,
+        properties: [],
       });
     }
 
@@ -102,7 +108,23 @@ dashboardRouter.get('/', requireAuth, requireRole('OWNER', 'MANAGER'), async (re
         db
           .select()
           .from(schema.payments)
-          .where(eq(schema.payments.organizationId, orgId))
+          .where(
+            and(
+              eq(schema.payments.organizationId, orgId),
+              inArray(
+                schema.payments.invoiceId,
+                db
+                  .select({ id: schema.invoices.id })
+                  .from(schema.invoices)
+                  .where(
+                    and(
+                      eq(schema.invoices.organizationId, orgId),
+                      inArray(schema.invoices.propertyId, activePropertyIds)
+                    )
+                  )
+              )
+            )
+          )
           .orderBy(desc(schema.payments.createdAt)),
       ]);
 

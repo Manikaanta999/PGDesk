@@ -21,6 +21,7 @@ import {
   tenantUpiSubmissionSchema,
   updateTenantProfileSchema,
 } from '../../lib/validation.ts';
+import { canAssociateTenantDocument, parseUploadedFileId } from './authorization.ts';
 import { AuthRequest, requireAuth, requireRole } from '../../middleware/auth.ts';
 import { logAudit } from '../audit.ts';
 
@@ -369,6 +370,58 @@ tenantPortalRouter.patch('/profile', requireAuth, requireRole('TENANT'), async (
     const { activeTenant, pastTenants } = await resolveAllTenantStays(user);
     const tenant = activeTenant ?? pastTenants[0] ?? null;
 
+    if (!tenant && d.idDocumentUrl) {
+      return res.status(404).json({ error: 'No tenant record is available for this ID document' });
+    }
+
+    const documentChanged = Boolean(
+      tenant && d.idDocumentUrl !== undefined && d.idDocumentUrl !== tenant.idDocumentUrl
+    );
+    const nextDocumentUrl = d.idDocumentUrl || null;
+    let nextDocumentFileId: number | null = null;
+    if (documentChanged && nextDocumentUrl) {
+      nextDocumentFileId = parseUploadedFileId(nextDocumentUrl);
+      if (nextDocumentFileId === null || !tenant) {
+        return res.status(400).json({ error: 'ID documents must be uploaded before they can be assigned' });
+      }
+
+      const [file] = await db
+        .select()
+        .from(schema.uploadedFiles)
+        .where(eq(schema.uploadedFiles.id, nextDocumentFileId))
+        .limit(1);
+      if (!file || !canAssociateTenantDocument(user, tenant, file)) {
+        return res.status(403).json({ error: 'You can only assign your own uploaded ID documents' });
+      }
+    }
+
+    if (
+      d.photoUrl !== undefined &&
+      d.photoUrl !== (tenant?.photoUrl ?? user.photoUrl) &&
+      d.photoUrl?.includes('/api/files')
+    ) {
+      const photoFileId = parseUploadedFileId(d.photoUrl);
+      if (photoFileId === null) {
+        return res.status(400).json({ error: 'Invalid profile photo file URL' });
+      }
+
+      const [photoFile] = await db
+        .select({
+          organizationId: schema.uploadedFiles.organizationId,
+          ownerUserId: schema.uploadedFiles.ownerUserId,
+        })
+        .from(schema.uploadedFiles)
+        .where(eq(schema.uploadedFiles.id, photoFileId))
+        .limit(1);
+      if (
+        !photoFile ||
+        photoFile.organizationId !== user.organizationId ||
+        photoFile.ownerUserId !== user.id
+      ) {
+        return res.status(403).json({ error: 'You can only assign your own uploaded profile photos' });
+      }
+    }
+
     // Protect verified KYC fields from student tampering
     if (tenant && tenant.kycVerifiedStatus === 'VERIFIED') {
       const idTypeChanged = d.idType && d.idType !== tenant.idType;
@@ -381,17 +434,16 @@ tenantPortalRouter.patch('/profile', requireAuth, requireRole('TENANT'), async (
       }
     }
 
-    await db
-      .update(schema.users)
-      .set({
-        name: d.name,
-        phone: cleanPhone || user.phone,
-        ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.users.id, user.id));
-
     if (!tenant) {
+      await db
+        .update(schema.users)
+        .set({
+          name: d.name,
+          phone: cleanPhone || user.phone,
+          ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.users.id, user.id));
       return res.json({
         userProfile: {
           name: d.name,
@@ -412,29 +464,92 @@ tenantPortalRouter.patch('/profile', requireAuth, requireRole('TENANT'), async (
       nextKycStatus = 'PENDING';
     }
 
-    const [updatedTenant] = await db
-      .update(schema.tenants)
-      .set({
-        name: d.name,
-        phone: cleanPhone || tenant.phone,
-        ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
-        ...(d.dateOfBirth !== undefined ? { dateOfBirth: d.dateOfBirth || null } : {}),
-        occupation: d.occupation || tenant.occupation || 'Resident',
-        companyOrCollege: d.companyOrCollege ?? '',
-        permanentAddress: d.permanentAddress ?? '',
-        emergencyContactName: d.emergencyContactName ?? '',
-        emergencyContactRelation: d.emergencyContactRelation ?? '',
-        emergencyContactPhone: cleanEmergencyPhone,
-        idType: d.idType || tenant.idType || 'Aadhaar',
-        idNumberMasked: d.idNumberMasked ?? '',
-        idDocumentUrl: d.idDocumentUrl !== undefined ? d.idDocumentUrl : tenant.idDocumentUrl,
-        kycVerifiedStatus: nextKycStatus,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.tenants.id, tenant.id))
-      .returning();
+    const result = await db.transaction(async (tx) => {
+      if (nextDocumentFileId !== null) {
+        const [file] = await tx
+          .select()
+          .from(schema.uploadedFiles)
+          .where(eq(schema.uploadedFiles.id, nextDocumentFileId))
+          .for('update')
+          .limit(1);
+        if (!file || !canAssociateTenantDocument(user, tenant, file)) {
+          return { denied: true as const };
+        }
+      }
 
-    return res.json({ tenant: updatedTenant });
+      if (documentChanged) {
+        if (nextDocumentFileId !== null) {
+          const [associatedFile] = await tx
+            .update(schema.uploadedFiles)
+            .set({ tenantId: tenant.id })
+            .where(
+              and(
+                eq(schema.uploadedFiles.id, nextDocumentFileId),
+                eq(schema.uploadedFiles.organizationId, tenant.organizationId),
+                eq(schema.uploadedFiles.ownerUserId, user.id),
+                eq(schema.uploadedFiles.isPrivate, true),
+                or(isNull(schema.uploadedFiles.tenantId), eq(schema.uploadedFiles.tenantId, tenant.id))
+              )
+            )
+            .returning({ id: schema.uploadedFiles.id });
+          if (!associatedFile) {
+            return { denied: true as const };
+          }
+        }
+
+        const previousFileId = parseUploadedFileId(tenant.idDocumentUrl);
+        if (previousFileId !== null && previousFileId !== nextDocumentFileId) {
+          await tx
+            .update(schema.uploadedFiles)
+            .set({ tenantId: null })
+            .where(
+              and(
+                eq(schema.uploadedFiles.id, previousFileId),
+                eq(schema.uploadedFiles.tenantId, tenant.id)
+              )
+            );
+        }
+      }
+
+      await tx
+        .update(schema.users)
+        .set({
+          name: d.name,
+          phone: cleanPhone || user.phone,
+          ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.users.id, user.id));
+
+      const [updatedTenant] = await tx
+        .update(schema.tenants)
+        .set({
+          name: d.name,
+          phone: cleanPhone || tenant.phone,
+          ...(d.photoUrl !== undefined ? { photoUrl: d.photoUrl || null } : {}),
+          ...(d.dateOfBirth !== undefined ? { dateOfBirth: d.dateOfBirth || null } : {}),
+          occupation: d.occupation || tenant.occupation || 'Resident',
+          companyOrCollege: d.companyOrCollege ?? '',
+          permanentAddress: d.permanentAddress ?? '',
+          emergencyContactName: d.emergencyContactName ?? '',
+          emergencyContactRelation: d.emergencyContactRelation ?? '',
+          emergencyContactPhone: cleanEmergencyPhone,
+          idType: d.idType || tenant.idType || 'Aadhaar',
+          idNumberMasked: d.idNumberMasked ?? '',
+          idDocumentUrl: d.idDocumentUrl !== undefined ? d.idDocumentUrl : tenant.idDocumentUrl,
+          kycVerifiedStatus: nextKycStatus,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.tenants.id, tenant.id))
+        .returning();
+      return { denied: false as const, updatedTenant };
+    });
+
+    if (result.denied) {
+      return res.status(403).json({ error: 'You can only assign your own uploaded ID documents' });
+    }
+
+    return res.json({ tenant: result.updatedTenant });
   } catch (err) {
     console.error('PATCH /api/tenant/profile error:', err);
     return res.status(500).json({ error: 'Failed to update resident profile' });

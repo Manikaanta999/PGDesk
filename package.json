@@ -12,7 +12,7 @@
     "lint": "tsc --noEmit",
     "db:generate": "drizzle-kit generate --config=src/db/drizzle.generate.config.ts",
     "db:migrate": "drizzle-kit migrate --config=src/db/drizzle.config.ts",
-    "test": "tsx --test src/lib/billing.test.ts src/lib/tenantCsv.test.ts src/lib/i18n.test.ts src/lib/studentPortalHelpers.test.ts src/lib/dashboardHelpers.test.ts src/lib/authPolicy.test.ts src/lib/authRoles.test.ts src/lib/platformAuth.test.ts src/lib/security.test.ts"
+    "test": "tsx --test src/lib/billing.test.ts src/lib/tenantCsv.test.ts src/lib/i18n.test.ts src/lib/studentPortalHelpers.test.ts src/lib/dashboardHelpers.test.ts src/lib/authPolicy.test.ts src/lib/authRoles.test.ts src/lib/platformAuth.test.ts src/lib/security.test.ts src/middleware/firebaseAuth.test.ts src/middleware/propertyAccess.test.ts src/server/routes/authorization.test.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^7.0.6",

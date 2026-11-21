@@ -1,11 +1,14 @@
 import crypto from 'node:crypto';
 import { NextFunction, Request, Response } from 'express';
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.ts';
 import { isEmailVerificationEnabled } from '../lib/authPolicy.ts';
 import { AppUserRole, computeSessionCookiePolicy, isEmbeddedAuthRequest } from '../lib/authRoles.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { signSessionToken, verifySessionToken } from '../lib/security.ts';
+import { resolveFirebaseAccount } from './firebaseAuth.ts';
+
+export { canAccessProperty, getAllowedPropertyIds } from './propertyAccess.ts';
 
 export interface AuthUser {
   id: number;
@@ -16,6 +19,7 @@ export interface AuthUser {
   photoUrl?: string | null;
   role: AppUserRole;
   assignedPropertyIds: number[];
+  organizationPropertyIds?: number[];
   tokenVersion?: number;
 }
 
@@ -26,6 +30,25 @@ export interface AuthRequest extends Request {
 }
 
 export const SESSION_COOKIE_NAME = 'pgdesk_session';
+export const GOOGLE_DEMO_ACCESS_REQUIRED_CODE = 'GOOGLE_DEMO_ACCESS_REQUIRED';
+export const GOOGLE_DEMO_ACCESS_REQUIRED_MESSAGE =
+  'PGDesk is not yet publicly released. Please contact the administrator to request demo access.';
+
+interface AuthResolutionError {
+  authError: {
+    code: typeof GOOGLE_DEMO_ACCESS_REQUIRED_CODE;
+    message: typeof GOOGLE_DEMO_ACCESS_REQUIRED_MESSAGE;
+  };
+}
+
+function googleDemoAccessRequired(): AuthResolutionError {
+  return {
+    authError: {
+      code: GOOGLE_DEMO_ACCESS_REQUIRED_CODE,
+      message: GOOGLE_DEMO_ACCESS_REQUIRED_MESSAGE,
+    },
+  };
+}
 
 export function isCrossOriginIframeRequest(req: Request): boolean {
   return isEmbeddedAuthRequest(
@@ -153,7 +176,9 @@ async function isSessionRecordActive(userId: number, sessionId: string): Promise
 
 export async function resolveAuthUser(
   req: Request
-): Promise<{ user: AuthUser; sessionId?: string; authMethod: 'SESSION' | 'GOOGLE' } | null> {
+): Promise<
+  { user: AuthUser; sessionId?: string; authMethod: 'SESSION' | 'GOOGLE' } | AuthResolutionError | null
+> {
   // 1. Check Authorization: Bearer <token> (works across iframes & blocked 3P cookies)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -185,119 +210,55 @@ export async function resolveAuthUser(
     if (!idToken) return null;
     try {
       const decoded = await adminAuth.verifyIdToken(idToken);
-      const email = (decoded.email || `${decoded.uid}@users.pgdesk.app`).trim().toLowerCase();
-      const existing = await db
-        .select()
-        .from(schema.users)
-        .where(eq(schema.users.uid, decoded.uid))
-        .limit(1);
-
-      if (existing[0]) {
-        const u = existing[0];
-        if (!u.isActive) return null;
-        if (u.role !== 'OWNER' && u.role !== 'MANAGER' && u.role !== 'TENANT') return null;
-        return {
-          authMethod: 'GOOGLE',
-          user: {
-            id: u.id,
-            organizationId: u.organizationId,
-            name: u.name,
-            email: u.email,
-            phone: u.phone,
-            photoUrl: u.photoUrl,
-            role: u.role,
-            assignedPropertyIds: Array.isArray(u.assignedPropertyIds) ? u.assignedPropertyIds : [],
-            tokenVersion: u.tokenVersion ?? 1,
-          },
-        };
-      }
-
-      const byEmail = await db
-        .select()
-        .from(schema.users)
-        .where(eq(schema.users.email, email))
-        .limit(1);
-
-      if (byEmail[0]) {
-        if (!byEmail[0].isActive) return null;
-        if (byEmail[0].role !== 'OWNER' && byEmail[0].role !== 'MANAGER' && byEmail[0].role !== 'TENANT') return null;
-        const [updated] = await db
-          .update(schema.users)
-          .set({ uid: decoded.uid, updatedAt: new Date() })
-          .where(eq(schema.users.id, byEmail[0].id))
-          .returning();
-        if (updated.role !== 'OWNER' && updated.role !== 'MANAGER' && updated.role !== 'TENANT') return null;
-        return {
-          authMethod: 'GOOGLE',
-          user: {
-            id: updated.id,
-            organizationId: updated.organizationId,
-            name: updated.name,
-            email: updated.email,
-            phone: updated.phone,
-            photoUrl: updated.photoUrl,
-            role: updated.role,
-            assignedPropertyIds: Array.isArray(updated.assignedPropertyIds)
-              ? updated.assignedPropertyIds
-              : [],
-            tokenVersion: updated.tokenVersion ?? 1,
-          },
-        };
-      }
-
-      const displayName = decoded.name || email.split('@')[0];
-      const orgName = `${displayName}'s Residences`;
-      const baseSlug =
-        orgName
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-+|-+$/g, '') || 'pg-workspace';
-      const [createdOrg] = await db
-        .insert(schema.organizations)
-        .values({
-          name: orgName,
-          slug: `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`,
-          upiId: `${baseSlug.replace(/-/g, '').slice(0, 16) || 'pgdesk'}@okicici`,
-          upiPayeeName: orgName,
-          planTier: 'STARTER',
-          phone: '+91 00000 00000',
-          email,
-          address: 'India',
-        })
-        .returning();
-
-      const [upserted] = await db
-        .insert(schema.users)
-        .values({
+      const firebaseAccount = await resolveFirebaseAccount(
+        {
           uid: decoded.uid,
-          organizationId: createdOrg.id,
-          name: displayName,
-          email,
-          role: 'OWNER',
-          assignedPropertyIds: [],
-          isActive: true,
-        })
-        .onConflictDoUpdate({
-          target: schema.users.email,
-          set: { uid: decoded.uid, updatedAt: new Date() },
-        })
-        .returning();
+          email: decoded.email,
+          emailVerified: decoded.email_verified,
+        },
+        {
+          async findByUid(uid) {
+            const [user] = await db.select().from(schema.users).where(eq(schema.users.uid, uid)).limit(1);
+            return user ?? null;
+          },
+          async findByEmail(email) {
+            const [user] = await db.select().from(schema.users).where(eq(schema.users.email, email)).limit(1);
+            return user ?? null;
+          },
+          async linkUnlinkedAccount(userId, email, uid) {
+            const [user] = await db
+              .update(schema.users)
+              .set({ uid, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(schema.users.id, userId),
+                  eq(schema.users.email, email),
+                  isNull(schema.users.uid),
+                  eq(schema.users.isActive, true),
+                  inArray(schema.users.role, ['OWNER', 'MANAGER', 'TENANT'])
+                )
+              )
+              .returning();
+            return user ?? null;
+          },
+        }
+      );
 
-      const role = upserted.role === 'MANAGER' || upserted.role === 'TENANT' ? upserted.role : 'OWNER';
+      if (firebaseAccount.kind === 'REJECTED') return googleDemoAccessRequired();
+
+      const u = firebaseAccount.account;
       return {
         authMethod: 'GOOGLE',
         user: {
-          id: upserted.id,
-          organizationId: upserted.organizationId,
-          name: upserted.name,
-          email: upserted.email,
-          phone: upserted.phone,
-          photoUrl: upserted.photoUrl,
-          role,
-          assignedPropertyIds: Array.isArray(upserted.assignedPropertyIds)
-            ? upserted.assignedPropertyIds
-            : [],
-          tokenVersion: upserted.tokenVersion ?? 1,
+          id: u.id,
+          organizationId: u.organizationId,
+          name: u.name,
+          email: u.email,
+          phone: u.phone,
+          photoUrl: u.photoUrl,
+          role: u.role,
+          assignedPropertyIds: Array.isArray(u.assignedPropertyIds) ? u.assignedPropertyIds : [],
+          tokenVersion: u.tokenVersion ?? 1,
         },
       };
     } catch (err) {
@@ -315,7 +276,26 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
     if (!resolved) {
       return res.status(401).json({ error: 'Authentication required' });
     }
-    req.user = resolved.user;
+    if ('authError' in resolved) {
+      return res.status(403).json({
+        code: resolved.authError.code,
+        error: resolved.authError.message,
+      });
+    }
+    const organizationPropertyIds =
+      resolved.user.role === 'OWNER' || resolved.user.role === 'MANAGER'
+        ? await db
+            .select({ id: schema.properties.id })
+            .from(schema.properties)
+            .where(
+              and(
+                eq(schema.properties.organizationId, resolved.user.organizationId),
+                isNull(schema.properties.deletedAt)
+              )
+            )
+            .then((properties) => properties.map((property) => property.id))
+        : [];
+    req.user = { ...resolved.user, organizationPropertyIds };
     req.sessionId = resolved.sessionId;
     req.authMethod = resolved.authMethod;
     next();
@@ -335,17 +315,4 @@ export function requireRole(...allowedRoles: AppUserRole[]) {
     }
     next();
   };
-}
-
-export function canAccessProperty(user: AuthUser, propertyId: number): boolean {
-  if (user.role === 'OWNER') return true;
-  if (user.assignedPropertyIds.length === 0) return true;
-  return user.assignedPropertyIds.includes(propertyId);
-}
-
-export function getAllowedPropertyIds(user: AuthUser, allPropertyIds: number[]): number[] {
-  if (user.role === 'OWNER' || user.assignedPropertyIds.length === 0) {
-    return allPropertyIds;
-  }
-  return allPropertyIds.filter((id) => user.assignedPropertyIds.includes(id));
 }

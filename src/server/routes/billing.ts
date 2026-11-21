@@ -17,6 +17,7 @@ import {
   requireAuth,
   requireRole,
 } from '../../middleware/auth.ts';
+import { hasConsistentPaymentRelations, resolvePropertyFilter } from './authorization.ts';
 import { logAudit } from '../audit.ts';
 import { runBillingCycleForOrg } from '../billingEngine.ts';
 
@@ -36,7 +37,6 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
     const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.min(100, Math.max(5, Number(req.query.pageSize || 25)));
     const statusFilter = String(req.query.status || 'ALL').toUpperCase();
-    const propertyId = req.query.propertyId ? Number(req.query.propertyId) : null;
     const monthFilter = String(req.query.month || '').trim();
     const search = String(req.query.search || '').trim().toLowerCase();
 
@@ -46,6 +46,14 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
       .where(and(eq(schema.properties.organizationId, user.organizationId), isNull(schema.properties.deletedAt)));
 
     const allowedIds = getAllowedPropertyIds(user, orgProps.map((p) => p.id));
+    const propertyFilter = resolvePropertyFilter(req.query.propertyId, allowedIds);
+    if (propertyFilter.kind === 'invalid') {
+      return res.status(400).json({ error: 'Invalid propertyId filter' });
+    }
+    if (propertyFilter.kind === 'forbidden') {
+      return res.status(403).json({ error: 'Access denied to this property' });
+    }
+    const propertyId = propertyFilter.kind === 'selected' ? propertyFilter.propertyId : null;
     if (allowedIds.length === 0) {
       return res.json({
         invoices: [],
@@ -69,19 +77,59 @@ billingRouter.get('/invoices', requireAuth, requireRole('OWNER', 'MANAGER'), asy
           )
         )
         .orderBy(desc(schema.invoices.periodYear), desc(schema.invoices.periodMonth), desc(schema.invoices.id)),
-      db.select().from(schema.tenants).where(eq(schema.tenants.organizationId, user.organizationId)),
-      db.select().from(schema.beds).where(eq(schema.beds.organizationId, user.organizationId)),
-      db.select().from(schema.rooms).where(eq(schema.rooms.organizationId, user.organizationId)),
+      db
+        .select()
+        .from(schema.tenants)
+        .where(
+          and(
+            eq(schema.tenants.organizationId, user.organizationId),
+            inArray(schema.tenants.propertyId, allowedIds)
+          )
+        ),
+      db
+        .select()
+        .from(schema.beds)
+        .where(
+          and(
+            eq(schema.beds.organizationId, user.organizationId),
+            inArray(schema.beds.propertyId, allowedIds)
+          )
+        ),
+      db
+        .select()
+        .from(schema.rooms)
+        .where(
+          and(
+            eq(schema.rooms.organizationId, user.organizationId),
+            inArray(schema.rooms.propertyId, allowedIds)
+          )
+        ),
       db
         .select()
         .from(schema.payments)
-        .where(eq(schema.payments.organizationId, user.organizationId))
+        .where(
+          and(
+            eq(schema.payments.organizationId, user.organizationId),
+            inArray(
+              schema.payments.invoiceId,
+              db
+                .select({ id: schema.invoices.id })
+                .from(schema.invoices)
+                .where(
+                  and(
+                    eq(schema.invoices.organizationId, user.organizationId),
+                    inArray(schema.invoices.propertyId, allowedIds)
+                  )
+                )
+            )
+          )
+        )
         .orderBy(desc(schema.payments.createdAt)),
       db.select().from(schema.organizations).where(eq(schema.organizations.id, user.organizationId)).limit(1),
     ]);
 
     const tenantMap = new Map(allTenants.map((t) => [t.id, t]));
-    const propMap = new Map(orgProps.map((p) => [p.id, p]));
+    const propMap = new Map(orgProps.filter((p) => allowedIds.includes(p.id)).map((p) => [p.id, p]));
     const bedMap = new Map(allBeds.map((b) => [b.id, b]));
     const roomMap = new Map(allRooms.map((r) => [r.id, r]));
     const org = orgRows[0];
@@ -218,7 +266,14 @@ billingRouter.post('/generate', requireAuth, requireRole('OWNER', 'MANAGER'), as
       .where(and(eq(schema.properties.organizationId, user.organizationId), isNull(schema.properties.deletedAt)));
 
     const allowedIds = getAllowedPropertyIds(user, orgProps.map((p) => p.id));
-    const targetPropIds = propertyId && allowedIds.includes(propertyId) ? [propertyId] : allowedIds;
+    const propertyFilter = resolvePropertyFilter(propertyId ?? undefined, allowedIds);
+    if (propertyFilter.kind === 'invalid') {
+      return res.status(400).json({ error: 'Invalid propertyId' });
+    }
+    if (propertyFilter.kind === 'forbidden') {
+      return res.status(403).json({ error: 'Access denied to this property' });
+    }
+    const targetPropIds = propertyFilter.kind === 'selected' ? [propertyFilter.propertyId] : allowedIds;
 
     if (targetPropIds.length === 0 || !org) {
       return res.status(400).json({ error: 'No accessible properties found' });
@@ -407,11 +462,38 @@ billingRouter.post('/payments/:id/review', requireAuth, requireRole('OWNER', 'MA
       const [invoice] = await tx
         .select()
         .from(schema.invoices)
-        .where(eq(schema.invoices.id, payment.invoiceId))
+        .where(
+          and(
+            eq(schema.invoices.id, payment.invoiceId),
+            eq(schema.invoices.organizationId, payment.organizationId)
+          )
+        )
         .for('update')
         .limit(1);
 
-      if (!invoice || !canAccessProperty(user, invoice.propertyId)) {
+      if (!invoice) {
+        throw new BillingHttpError(403, 'Access denied');
+      }
+
+      const [tenant] = await tx
+        .select()
+        .from(schema.tenants)
+        .where(
+          and(
+            eq(schema.tenants.id, payment.tenantId),
+            eq(schema.tenants.organizationId, payment.organizationId),
+            eq(schema.tenants.propertyId, invoice.propertyId),
+            isNull(schema.tenants.deletedAt)
+          )
+        )
+        .for('update')
+        .limit(1);
+
+      if (
+        !tenant ||
+        !hasConsistentPaymentRelations(user.organizationId, payment, invoice, tenant) ||
+        !canAccessProperty(user, invoice.propertyId)
+      ) {
         throw new BillingHttpError(403, 'Access denied');
       }
 
@@ -423,7 +505,15 @@ billingRouter.post('/payments/:id/review', requireAuth, requireRole('OWNER', 'MA
           recordedByUserId: user.id,
           updatedAt: new Date(),
         })
-        .where(and(eq(schema.payments.id, payment.id), eq(schema.payments.approvalStatus, 'PENDING_APPROVAL')))
+        .where(
+          and(
+            eq(schema.payments.id, payment.id),
+            eq(schema.payments.organizationId, user.organizationId),
+            eq(schema.payments.invoiceId, invoice.id),
+            eq(schema.payments.tenantId, tenant.id),
+            eq(schema.payments.approvalStatus, 'PENDING_APPROVAL')
+          )
+        )
         .returning();
 
       if (!updatedPayment) {
@@ -434,7 +524,13 @@ billingRouter.post('/payments/:id/review', requireAuth, requireRole('OWNER', 'MA
         const invPayments = await tx
           .select()
           .from(schema.payments)
-          .where(and(eq(schema.payments.invoiceId, invoice.id), eq(schema.payments.approvalStatus, 'APPROVED')));
+          .where(
+            and(
+              eq(schema.payments.invoiceId, invoice.id),
+              eq(schema.payments.organizationId, user.organizationId),
+              eq(schema.payments.approvalStatus, 'APPROVED')
+            )
+          );
         const newPaid = computeApprovedPaidAmount(invPayments);
         if (newPaid > invoice.amount) {
           throw new BillingHttpError(
@@ -451,7 +547,12 @@ billingRouter.post('/payments/:id/review', requireAuth, requireRole('OWNER', 'MA
         await tx
           .update(schema.invoices)
           .set({ paidAmount: newPaid, status: nextStatus, updatedAt: new Date() })
-          .where(eq(schema.invoices.id, invoice.id));
+          .where(
+            and(
+              eq(schema.invoices.id, invoice.id),
+              eq(schema.invoices.organizationId, user.organizationId)
+            )
+          );
       }
 
       return { payment: updatedPayment, newApprovalStatus };

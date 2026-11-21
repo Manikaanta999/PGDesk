@@ -91,6 +91,14 @@ authRouter.get('/me', async (req, res) => {
     const demoModeEnabled = isDemoModeEnabled();
     const authPolicy = getAuthTestingPolicy();
     const resolved = await resolveAuthUser(req);
+    if (resolved && 'authError' in resolved) {
+      return res.status(403).json({
+        code: resolved.authError.code,
+        error: resolved.authError.message,
+        demoModeEnabled,
+        authPolicy,
+      });
+    }
     const user = resolved?.user ?? null;
     if (!user) {
       return res.json({ user: null, demoModeEnabled, authPolicy });
@@ -744,7 +752,7 @@ authRouter.post('/demo', async (req, res) => {
 authRouter.post('/logout', async (req: Request, res: Response) => {
   try {
     const resolved = await resolveAuthUser(req);
-    if (resolved?.sessionId) {
+    if (resolved && !('authError' in resolved) && resolved.sessionId) {
       await db
         .update(schema.userSessions)
         .set({ revokedAt: new Date() })
