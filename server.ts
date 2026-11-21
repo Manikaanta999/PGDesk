@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import cookieParser from 'cookie-parser';
-import { and, eq, isNull, ne } from 'drizzle-orm';
+import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -24,7 +24,16 @@ async function startServer() {
 
   const app = express();
   app.set('trust proxy', 1);
-  const PORT = 3000;
+  const configuredPort = process.env.PORT;
+  const PORT = configuredPort === undefined ? 3000 : Number(configuredPort);
+  if (
+    (configuredPort !== undefined && !/^\d+$/.test(configuredPort.trim())) ||
+    !Number.isInteger(PORT) ||
+    PORT < 1 ||
+    PORT > 65535
+  ) {
+    throw new Error('PORT must be an integer between 1 and 65535.');
+  }
 
   app.use(express.json({ limit: '8mb' }));
   app.use(cookieParser());
@@ -42,8 +51,13 @@ async function startServer() {
   }
 
   // API routes
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'pgdesk' });
+  app.get('/api/health', async (_req, res) => {
+    try {
+      await db.execute(sql`SELECT 1`);
+      res.status(200).json({ ok: true, service: 'pgdesk' });
+    } catch {
+      res.status(503).json({ ok: false, service: 'pgdesk' });
+    }
   });
 
   app.use('/api/auth', authRouter);
@@ -135,7 +149,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PGDesk server running on http://localhost:${PORT}`);
+    console.log(`PGDesk server running on http://0.0.0.0:${PORT}`);
     void (async () => {
       try {
         await ensureSeeded();
